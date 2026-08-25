@@ -26,6 +26,8 @@ htmlcov/
 .idea/
 .DS_Store
 
+.claude/settings.local.json
+
 # Build
 dist/
 build/
