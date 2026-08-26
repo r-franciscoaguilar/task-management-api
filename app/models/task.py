@@ -18,10 +18,16 @@ if TYPE_CHECKING:
 class TaskStatus(str, enum.Enum):
     """The lifecycle of a work item.
 
-    Movement is forward-only: UNASSIGNED -> ASSIGNED -> IN_PROGRESS -> DONE.
-    There is deliberately no operation anywhere in the API that moves a task
-    backwards, so the invariant is enforced by absence rather than by a guard
-    that could be bypassed.
+    The forward path is UNASSIGNED -> ASSIGNED -> IN_PROGRESS -> DONE, and
+    DONE is terminal.
+
+    There is exactly one backward edge: an assignee may release work from
+    IN_PROGRESS back to ASSIGNED, and only with a recorded reason. That
+    implements the business rule "work should not move backward without a
+    good reason" as an audited action rather than an unenforced expectation.
+    Every other backward move is impossible because no operation exists for
+    it -- the invariant is enforced by absence, not by a guard that could be
+    bypassed.
     """
 
     UNASSIGNED = "UNASSIGNED"

@@ -5,6 +5,7 @@ from fastapi import FastAPI
 
 from app import models
 from app.db import Base, engine
+from app.exceptions import register_exception_handlers
 
 
 @asynccontextmanager
@@ -17,6 +18,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
 
 app = FastAPI(title="Task Management API", lifespan=lifespan)
+register_exception_handlers(app)
 
 
 @app.get("/health")
