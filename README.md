@@ -8,11 +8,12 @@ Built for the Software Engineer III take-home assessment. **Backend only** —
 there is no frontend, and other systems are expected to integrate with this API.
 
 > **Build status:** in progress, implemented step by step.
-> Done: data model, identity/authorization, error handling, demo data, user
-> endpoints, task create/list/detail with scoping and pagination, assignment
-> with its notification trail.
-> **Not yet: lifecycle transitions (start/complete/release), and real SMTP
-> delivery — the shipped sender is a no-op.**
+> Done: the full workflow — data model, identity/authorization, error handling,
+> demo data, task creation, scoped listing with pagination, assignment with its
+> notification trail, and the complete lifecycle including the audited
+> backward transition.
+> **Not yet: real SMTP delivery — the shipped sender is a no-op — and the
+> reflection answers below.**
 > See [Implementation status](#implementation-status) for the current state.
 
 ---
@@ -182,6 +183,62 @@ curl -s localhost:8000/tasks/5 -H 'X-User-Id: 4'
 # {"error":"not_found","message":"No task with id 5 is available to you."}
 ```
 
+### A full walkthrough
+
+Carol files a task, Alice routes it, and it changes hands halfway through.
+
+```bash
+# 1. Carol (worker) files something she noticed.
+curl -s -X POST localhost:8000/tasks -H 'X-User-Id: 3' \
+  -H 'Content-Type: application/json' \
+  -d '{"title": "Fix conveyor belt"}'
+# -> 201, status UNASSIGNED.  Note the id it returns and use it below as $ID.
+
+# 2. Alice (manager) assigns it to Carol. Carol is emailed.
+curl -s -X POST localhost:8000/tasks/$ID/assign -H 'X-User-Id: 1' \
+  -H 'Content-Type: application/json' -d '{"assignee_id": 3}'
+# -> 200, status ASSIGNED, latest_assignment.notification_status SENT
+
+# 3. Carol picks it up.
+curl -s -X POST localhost:8000/tasks/$ID/start -H 'X-User-Id: 3'
+# -> 200, status IN_PROGRESS
+
+# 4. Alice tries to hand it to Dave instead. Refused: work is under way.
+curl -s -X POST localhost:8000/tasks/$ID/assign -H 'X-User-Id: 1' \
+  -H 'Content-Type: application/json' -d '{"assignee_id": 4}'
+# -> 409 invalid_state_transition
+
+# 5. Carol releases it, saying why. This is the only backward move.
+curl -s -X POST localhost:8000/tasks/$ID/release -H 'X-User-Id: 3' \
+  -H 'Content-Type: application/json' \
+  -d '{"reason": "Waiting on a replacement bearing"}'
+# -> 200, status ASSIGNED
+
+# 6. Now Alice can redirect it, and Dave finishes it.
+curl -s -X POST localhost:8000/tasks/$ID/assign -H 'X-User-Id: 1' \
+  -H 'Content-Type: application/json' -d '{"assignee_id": 4}'
+curl -s -X POST localhost:8000/tasks/$ID/start    -H 'X-User-Id: 4'
+curl -s -X POST localhost:8000/tasks/$ID/complete -H 'X-User-Id: 4'
+
+# 7. The whole story, from either angle.
+curl -s localhost:8000/tasks/$ID/history     -H 'X-User-Id: 1'
+curl -s localhost:8000/tasks/$ID/assignments -H 'X-User-Id: 1'
+```
+
+Step 7 yields the lifecycle ledger:
+
+```
+UNASSIGNED   -> ASSIGNED      by Alice Nguyen
+ASSIGNED     -> IN_PROGRESS   by Carol Diaz
+IN_PROGRESS  -> ASSIGNED      by Carol Diaz       reason: Waiting on a replacement bearing
+ASSIGNED     -> IN_PROGRESS   by Dave Lindqvist
+IN_PROGRESS  -> DONE          by Dave Lindqvist
+```
+
+Steps 4 through 6 are the reason `release` exists. Without it, work picked up by
+the wrong person could never be redirected, and a blocked worker's only options
+would be to abandon the task in `IN_PROGRESS` or falsely mark it `DONE`.
+
 Omitting the header is a 401, as is an unknown or non-numeric id:
 
 ```json
@@ -232,7 +289,11 @@ the shapes described under [Design notes](#design-notes).
 | `GET` | `/tasks` | scoped | `?status=&assignee_id=&creator_id=&limit=&offset=` |
 | `GET` | `/tasks/{id}` | scoped | 404 if the caller may not see it; includes `latest_assignment` |
 | `POST` | `/tasks/{id}/assign` | managers | `{assignee_id}` — notifies the assignee |
+| `POST` | `/tasks/{id}/start` | assignee only | `ASSIGNED` → `IN_PROGRESS` |
+| `POST` | `/tasks/{id}/complete` | assignee only | `IN_PROGRESS` → `DONE` |
+| `POST` | `/tasks/{id}/release` | assignee only | `{reason}` required — `IN_PROGRESS` → `ASSIGNED` |
 | `GET` | `/tasks/{id}/assignments` | scoped | Assignment and notification history, newest first |
+| `GET` | `/tasks/{id}/history` | scoped | Lifecycle history including release reasons |
 
 `GET /users` returns a plain array rather than the paginated envelope planned
 for tasks. Users are a small bounded reference set; the brief asks specifically
@@ -304,14 +365,31 @@ double-submitted request would otherwise mail the same person twice. A separate
 "resend notification" action would be the right way to nudge someone, and is
 listed as future work.
 
-### Planned
+### Lifecycle rules
 
-| Method | Path | Who |
+Progress is recorded by the person doing the work — never by a manager on their
+behalf, which the brief calls out explicitly. So `start`, `complete` and
+`release` are all **workers only, and only the assignee**.
+
+Refusals distinguish three different situations, which is the whole point of
+having them:
+
+| Situation | Status | `error` |
 |---|---|---|
-| `POST` | `/tasks/{id}/start` | assignee |
-| `POST` | `/tasks/{id}/complete` | assignee |
-| `POST` | `/tasks/{id}/release` | assignee, reason required |
-| `GET` | `/tasks/{id}/history` | scoped |
+| Caller is a manager | 403 | `worker_role_required` |
+| Caller cannot see the task at all | 404 | `not_found` |
+| Caller can see it but is not the assignee | 403 | `not_assignee` |
+| The move is not legal from the current status | 409 | `invalid_state_transition` |
+| Release without a real reason | 422 | `validation_error` |
+
+The 404-versus-403 split is deliberate. Visibility is checked first, so a task
+the caller may not see returns 404 and leaks nothing. Only then does being the
+assignee matter — and failing *that* is a 403, because the caller can already
+see the task, so denying its existence would be nonsense.
+
+Every refusal carries `current_status`, which a client retrying after a timeout
+needs to reconcile its own view. Nothing is recorded when a transition is
+refused.
 
 ---
 
@@ -487,6 +565,7 @@ tests/
   test_task_visibility.py    who can see which tasks
   test_pagination.py         paging, and that it cannot widen scope
   test_assignment.py         assigning, reassigning, and notification outcomes
+  test_lifecycle.py          transitions, refusals, and the release path
   test_health.py
 ```
 
@@ -547,6 +626,13 @@ Currently covered:
 - Notification failure: the assignment survives, the failure is recorded with
   its error text, an *undeclared* exception type is handled the same way, and no
   email is attempted when authorization or validation fails
+- Lifecycle: the full journey end to end, every illegal transition refused with
+  `current_status`, `DONE` immovable in both directions, managers barred from
+  progressing work, the 404-vs-403 tiers, and that a refused transition records
+  nothing
+- Release: the reason stored and trimmed, blank and missing reasons rejected,
+  the assignee retained, released work restartable, and — the case release was
+  added for — a previously unreassignable task becoming reassignable
 
 Tests run against the real application with the database dependency swapped for
 an in-memory one. `TestClient` is deliberately used *without* its context
@@ -565,7 +651,7 @@ the developer's real `app.db` during a test run.
 | User endpoints | done |
 | Task create / list / detail with role scoping | done |
 | Assignment + notification abstraction | done (real SMTP still pending) |
-| Lifecycle transitions (start / complete / release) | not started |
+| Lifecycle transitions (start / complete / release) | done |
 | Pagination | done |
 | Real SMTP delivery | not started (deliberately last) |
 

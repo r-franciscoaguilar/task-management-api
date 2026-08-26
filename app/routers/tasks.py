@@ -7,11 +7,25 @@ about who may do what lives in app/services/tasks.py.
 from fastapi import APIRouter, Query, status
 from sqlalchemy import select
 
-from app.deps import CurrentUser, DbSession, ManagerUser, Pagination, Sender
-from app.models import AssignmentEvent, Task, TaskStatus
+from app.deps import (
+    CurrentUser,
+    DbSession,
+    ManagerUser,
+    Pagination,
+    Sender,
+    WorkerUser,
+)
+from app.models import AssignmentEvent, StatusChangeEvent, Task, TaskStatus
 from app.schemas.assignment_event import AssignmentEventOut
 from app.schemas.pagination import Page
-from app.schemas.task import AssignRequest, TaskCreate, TaskDetailOut, TaskOut
+from app.schemas.status_change_event import StatusChangeEventOut
+from app.schemas.task import (
+    AssignRequest,
+    ReleaseRequest,
+    TaskCreate,
+    TaskDetailOut,
+    TaskOut,
+)
 from app.services import tasks as task_service
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
@@ -116,6 +130,58 @@ def assign_task(
         task.assignment_events[0]
     )
     return detail
+
+
+@router.post(
+    "/{task_id}/start", response_model=TaskOut, summary="Start assigned work"
+)
+def start_task(task_id: int, db: DbSession, caller: WorkerUser) -> Task:
+    """Move a task to IN_PROGRESS.
+
+    Workers only, and only the assignee: the brief says managers "should not be
+    doing someone else's work on their behalf", so progressing a task is not a
+    manager capability at all.
+    """
+    return task_service.start_task(db, caller=caller, task_id=task_id)
+
+
+@router.post(
+    "/{task_id}/complete", response_model=TaskOut, summary="Complete work"
+)
+def complete_task(task_id: int, db: DbSession, caller: WorkerUser) -> Task:
+    """Move a task to DONE, which is terminal."""
+    return task_service.complete_task(db, caller=caller, task_id=task_id)
+
+
+@router.post(
+    "/{task_id}/release",
+    response_model=TaskOut,
+    summary="Hand work back, with a reason",
+)
+def release_task(
+    task_id: int, payload: ReleaseRequest, db: DbSession, caller: WorkerUser
+) -> Task:
+    """Return in-progress work to ASSIGNED, recording why.
+
+    The only backward transition in the system. The reason is mandatory and is
+    kept in the task's history, which is what makes "not backward without a good
+    reason" an enforced rule rather than an expectation.
+    """
+    return task_service.release_task(
+        db, caller=caller, task_id=task_id, reason=payload.reason
+    )
+
+
+@router.get(
+    "/{task_id}/history",
+    response_model=list[StatusChangeEventOut],
+    summary="Lifecycle history",
+)
+def list_history(
+    task_id: int, db: DbSession, caller: CurrentUser
+) -> list[StatusChangeEvent]:
+    """Every status change this task has been through, newest first."""
+    return task_service.list_status_history(db, caller=caller, task_id=task_id)
 
 
 @router.get(

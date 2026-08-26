@@ -74,3 +74,24 @@ class TaskDetailOut(TaskOut):
 
 class AssignRequest(BaseModel):
     assignee_id: int = Field(description="Id of the worker to make responsible.")
+
+
+class ReleaseRequest(BaseModel):
+    """Handing work back requires saying why.
+
+    The reason is mandatory at the edge as well as in the service, so a client
+    gets a clear 422 rather than discovering the rule deeper in.
+    """
+
+    reason: str = Field(
+        max_length=500,
+        description="Why the work cannot be continued right now.",
+    )
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_must_have_content(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("reason must not be blank")
+        return stripped

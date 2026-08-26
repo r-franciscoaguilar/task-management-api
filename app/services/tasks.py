@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 from app.core.time import utcnow
 from app.exceptions import (
     ConflictError,
+    ForbiddenError,
     InvalidStateTransitionError,
     NotFoundError,
     ValidationError,
@@ -284,3 +285,126 @@ def _notify_assignee(
         event.notification_error = None
 
     session.commit()
+
+
+def list_status_history(
+    session: Session, *, caller: User, task_id: int
+) -> list[StatusChangeEvent]:
+    """The lifecycle history of one task, newest first."""
+    task = get_task(session, caller=caller, task_id=task_id)
+    return list(task.status_change_events)
+
+
+def _load_task_to_act_on(session: Session, *, caller: User, task_id: int) -> Task:
+    """Fetch a task the caller is allowed to *change*, not merely to read.
+
+    Two tiers, and the distinction is intentional. Visibility comes first, so a
+    task the caller cannot see is a 404 -- they must not learn it exists. Only
+    then does being the assignee matter, and failing that is a 403: the caller
+    can see the task, so denying knowledge of it would be nonsense.
+    """
+    task = get_task(session, caller=caller, task_id=task_id)
+    if task.assignee_id != caller.id:
+        raise ForbiddenError(
+            "Only the person a task is assigned to can record progress on it.",
+            error_code="not_assignee",
+        )
+    return task
+
+
+def _record_transition(
+    session: Session,
+    *,
+    caller: User,
+    task: Task,
+    to: TaskStatus,
+    reason: str | None = None,
+) -> Task:
+    """Move a task and write the matching history row.
+
+    Single funnel for every lifecycle change, so a transition cannot be made
+    without being recorded.
+    """
+    now = utcnow()
+
+    session.add(
+        StatusChangeEvent(
+            task=task,
+            from_status=task.status,
+            to_status=to,
+            changed_by=caller,
+            reason=reason,
+            changed_at=now,
+        )
+    )
+
+    task.status = to
+    task.updated_at = now
+    if to is TaskStatus.DONE:
+        task.completed_at = now
+
+    session.commit()
+    return task
+
+
+def start_task(session: Session, *, caller: User, task_id: int) -> Task:
+    """Pick up assigned work."""
+    task = _load_task_to_act_on(session, caller=caller, task_id=task_id)
+
+    if task.status is not TaskStatus.ASSIGNED:
+        raise InvalidStateTransitionError(
+            "Only a task that is assigned and not yet started can be started.",
+            current_status=task.status.value,
+        )
+
+    return _record_transition(session, caller=caller, task=task, to=TaskStatus.IN_PROGRESS)
+
+
+def complete_task(session: Session, *, caller: User, task_id: int) -> Task:
+    """Finish work that is under way."""
+    task = _load_task_to_act_on(session, caller=caller, task_id=task_id)
+
+    if task.status is not TaskStatus.IN_PROGRESS:
+        raise InvalidStateTransitionError(
+            "Only work that is in progress can be completed.",
+            current_status=task.status.value,
+        )
+
+    return _record_transition(session, caller=caller, task=task, to=TaskStatus.DONE)
+
+
+def release_task(
+    session: Session, *, caller: User, task_id: int, reason: str
+) -> Task:
+    """Hand work back because it cannot be continued.
+
+    The one backward transition in the system. The brief asks that work not move
+    backward "without a good reason", so the reason is mandatory and is stored
+    on the history row -- turning the rule into an auditable record instead of an
+    unenforced expectation.
+
+    The task returns to ASSIGNED and stays with the same person. It is not
+    orphaned: someone remains nominally responsible until a manager redirects
+    it, which they now can, since reassignment is blocked only while work is
+    actually under way.
+    """
+    task = _load_task_to_act_on(session, caller=caller, task_id=task_id)
+
+    if task.status is not TaskStatus.IN_PROGRESS:
+        raise InvalidStateTransitionError(
+            "Only work that is in progress can be released.",
+            current_status=task.status.value,
+        )
+
+    # Also checked in the request schema; enforced here too because the service
+    # layer -- not the HTTP layer -- owns this rule.
+    cleaned = reason.strip()
+    if not cleaned:
+        raise ValidationError(
+            "Releasing work requires a reason.",
+            error_code="reason_required",
+        )
+
+    return _record_transition(
+        session, caller=caller, task=task, to=TaskStatus.ASSIGNED, reason=cleaned
+    )
