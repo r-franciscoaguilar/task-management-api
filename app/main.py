@@ -4,8 +4,9 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app import models
-from app.db import Base, engine
+from app.db import Base, SessionLocal, engine
 from app.exceptions import register_exception_handlers
+from app.seed import seed_if_empty
 
 
 @asynccontextmanager
@@ -14,6 +15,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # deployment in scope, so create_all is enough. See the README for why,
     # and what would change before production.
     Base.metadata.create_all(bind=engine)
+
+    # Seeding on boot is a deliberate operability choice: `uvicorn app.main:app`
+    # alone leaves a reviewer with data to exercise, no extra step to discover.
+    # It is a no-op once any user exists, so restarts never duplicate or clobber.
+    with SessionLocal() as session:
+        seed_if_empty(session)
+
     yield
 
 

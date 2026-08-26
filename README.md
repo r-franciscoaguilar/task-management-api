@@ -8,8 +8,8 @@ Built for the Software Engineer III take-home assessment. **Backend only** —
 there is no frontend, and other systems are expected to integrate with this API.
 
 > **Build status:** in progress, implemented step by step.
-> Done: data model, identity/authorization layer, error handling.
-> Not yet: task endpoints, seed data, real email delivery.
+> Done: data model, identity/authorization layer, error handling, demo data.
+> Not yet: the HTTP endpoints and real email delivery.
 > See [Implementation status](#implementation-status) for the current state.
 
 ---
@@ -30,8 +30,15 @@ pytest -q                          # run the test suite
 
 Interactive API docs are at `http://127.0.0.1:8000/docs` once running.
 
-The database is a local SQLite file (`app.db`) created automatically on first
-boot. Delete it to start clean.
+The database is a local SQLite file (`app.db`), created **and populated with
+demo data** on first boot — no extra setup step. See
+[Sample data](#sample-data) for the cast of users and how to act as them.
+
+```bash
+rm app.db                     # start completely clean
+python -m app.seed            # seed explicitly (no-op if users already exist)
+python -m app.seed --reset    # drop everything and rebuild
+```
 
 ---
 
@@ -115,6 +122,72 @@ because the brief explicitly removes authentication from scope. Authorization is
 a different matter and is fully enforced server-side, with tests covering each
 boundary. Swapping the header for a verified JWT would mean changing one
 dependency function and nothing else.
+
+---
+
+## Sample data
+
+Seeded automatically on first boot. User ids are deterministic, so they can be
+copied straight into the `X-User-Id` header.
+
+| id | Name | Role |
+|---|---|---|
+| 1 | Alice Nguyen | manager |
+| 2 | Bob Okafor | manager |
+| 3 | Carol Diaz | worker |
+| 4 | Dave Lindqvist | worker |
+| 5 | Erin Sokolov | worker |
+
+Seven tasks cover the whole lifecycle plus the cases that are easy to get wrong:
+
+| id | Task | Status | Why it is here |
+|---|---|---|---|
+| 1 | Replace intake filter on pump 3 | `UNASSIGNED` | Filed, waiting to be routed |
+| 2 | Loading bay door sticks when closing | `UNASSIGNED` | **Filed by a worker** — creation is not manager-only |
+| 3 | Audit safety signage in warehouse B | `ASSIGNED` | Routed, not yet picked up |
+| 4 | Reconcile October delivery invoices | `IN_PROGRESS` | Being worked on |
+| 5 | Update onboarding checklist | `DONE` | Complete, end to end |
+| 6 | Recalibrate scale in the loading bay | `ASSIGNED` | **Started, released with a reason, then reassigned** |
+| 7 | Spot-check inventory counts on aisle 7 | `ASSIGNED` | **Notification failed** — the assignment still stands, and the failure is visible |
+
+Task 6 is the one to look at to understand the data model: it has two
+assignment records but only one of them corresponds to a status change, because
+reassigning it moved ownership while the status stayed `ASSIGNED`.
+
+### Acting as a user
+
+Every request identifies its caller by header:
+
+```bash
+curl -s localhost:8000/tasks -H 'X-User-Id: 1'   # as Alice, a manager
+curl -s localhost:8000/tasks -H 'X-User-Id: 3'   # as Carol, a worker
+```
+
+A full walkthrough will be added here once the endpoints exist.
+
+### How the demo data is built, and why it matters
+
+The seed does not simply insert seven task rows. A task sitting in
+`IN_PROGRESS` with no assignment or status history would contradict the
+invariants the API enforces — it would mean someone was made responsible for
+work with no record of them being told, which is exactly what the traceability
+requirement forbids. So the seed walks each task through its lifecycle and
+writes the same event rows the service layer writes.
+
+It deliberately does **not** call the service layer to do that, even though
+that would guarantee consistency for free: assigning a task sends a real email,
+so seeding through the services would fire notifications at fake addresses on
+every fresh boot. The helpers in `app/seed.py` mirror the service behaviour
+instead, and `tests/test_seed.py` asserts the result satisfies the invariants —
+so drift is caught by a failing test rather than assumed away.
+
+Those tests are worth more than they might appear. They check that status
+history forms an unbroken chain, that `Task.assignee_id` always agrees with the
+newest assignment record, that only backward moves carry a reason, and that
+assignees are always workers. They already caught one real bug: a freshly
+constructed `Task` has `status = None` until it is flushed, because column
+defaults are applied on INSERT rather than in `__init__`, so the first version
+of the seed recorded a status change *from* nothing.
 
 ---
 
@@ -220,6 +293,7 @@ app/
   db.py                      engine, session factory, get_db dependency
   deps.py                    caller identity (X-User-Id) and role guards
   exceptions.py              AppError hierarchy + the single error envelope
+  seed.py                    demo data; also runnable as `python -m app.seed`
   core/
     config.py                environment-backed settings
     time.py                  utcnow() and the UtcDateTime column type
@@ -227,6 +301,7 @@ app/
 tests/
   conftest.py                in-memory DB and fixtures shared by all tests
   test_auth_and_errors.py    identity, role guards, error envelope
+  test_seed.py               demo data obeys the domain invariants
   test_health.py
 ```
 
@@ -269,6 +344,9 @@ Currently covered:
   worker actions
 - The error envelope: domain errors, context fields, unmatched routes, and
   framework validation errors all producing one consistent shape
+- Demo data integrity: unbroken status history, assignee agreeing with the
+  newest assignment record, reasons present on backward moves only, completion
+  timestamps, and assignees always being workers
 
 ---
 
@@ -278,7 +356,7 @@ Currently covered:
 |---|---|
 | Data model (users, tasks, assignment + status-change events) | done |
 | Identity, role guards, error envelope | done |
-| Seed data | not started |
+| Seed data | done |
 | User endpoints | not started |
 | Task create / list / detail with role scoping | not started |
 | Assignment + notification abstraction | not started |
