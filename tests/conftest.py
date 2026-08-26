@@ -14,8 +14,9 @@ from sqlalchemy import Engine, create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from app.core.time import utcnow
 from app.db import Base
-from app.models import User, UserRole
+from app.models import Task, TaskStatus, User, UserRole
 
 
 @pytest.fixture()
@@ -98,3 +99,35 @@ def client(
         yield TestClient(app)
     finally:
         app.dependency_overrides.clear()
+
+
+@pytest.fixture()
+def make_task(db: Session) -> Callable[..., Task]:
+    """Build a task directly in the database.
+
+    Tests arrange state through this rather than through the API so that a
+    failure in, say, the assign endpoint cannot make unrelated tests fail to
+    set up.
+    """
+
+    def _make(
+        *,
+        creator: User,
+        title: str = "Some work",
+        description: str | None = None,
+        assignee: User | None = None,
+        status: TaskStatus = TaskStatus.UNASSIGNED,
+    ) -> Task:
+        task = Task(
+            title=title,
+            description=description,
+            creator_id=creator.id,
+            assignee_id=assignee.id if assignee else None,
+            status=status,
+            assigned_at=utcnow() if assignee else None,
+        )
+        db.add(task)
+        db.commit()
+        return task
+
+    return _make

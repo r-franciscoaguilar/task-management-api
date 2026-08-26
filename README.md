@@ -9,8 +9,8 @@ there is no frontend, and other systems are expected to integrate with this API.
 
 > **Build status:** in progress, implemented step by step.
 > Done: data model, identity/authorization layer, error handling, demo data,
-> user endpoints.
-> Not yet: task endpoints and real email delivery.
+> user endpoints, task creation/listing/detail with role scoping and pagination.
+> Not yet: assignment, lifecycle transitions, real email delivery.
 > See [Implementation status](#implementation-status) for the current state.
 
 ---
@@ -164,6 +164,22 @@ curl -s localhost:8000/users/me -H 'X-User-Id: 1'   # as Alice, a manager
 curl -s localhost:8000/users/me -H 'X-User-Id: 3'   # as Carol, a worker
 ```
 
+Scoping is easiest to see by comparing two callers against the seeded data:
+
+```bash
+curl -s localhost:8000/tasks -H 'X-User-Id: 1'   # Alice, manager: total 7
+curl -s localhost:8000/tasks -H 'X-User-Id: 4'   # Dave, worker:  total 3
+```
+
+Dave sees three tasks for two different reasons — he is the **assignee** of
+tasks 4 and 6, and the **creator** of task 2, which nobody has been assigned
+yet. Asking for a task that is neither is a 404:
+
+```bash
+curl -s localhost:8000/tasks/5 -H 'X-User-Id: 4'
+# {"error":"not_found","message":"No task with id 5 is available to you."}
+```
+
 Omitting the header is a 401, as is an unknown or non-numeric id:
 
 ```json
@@ -210,6 +226,9 @@ the shapes described under [Design notes](#design-notes).
 | `GET` | `/health` | anyone | Liveness check; no identity required |
 | `GET` | `/users/me` | any caller | The caller's own record and role |
 | `GET` | `/users` | any caller | Optional `?role=MANAGER\|WORKER` filter (uppercase) |
+| `POST` | `/tasks` | any caller | `{title, description?}` → 201, always starts `UNASSIGNED` |
+| `GET` | `/tasks` | scoped | `?status=&assignee_id=&creator_id=&limit=&offset=` |
+| `GET` | `/tasks/{id}` | scoped | 404 if the caller may not see it |
 
 `GET /users` returns a plain array rather than the paginated envelope planned
 for tasks. Users are a small bounded reference set; the brief asks specifically
@@ -224,13 +243,45 @@ Response models are explicit rather than derived from the ORM, so adding a
 column to a model can never silently leak it into an API response. There is a
 test asserting exactly that.
 
+### Scoping
+
+`GET /tasks` returns different rows depending on who asks:
+
+- **Managers** see every task, and may filter by `assignee_id` or `creator_id`
+  to inspect anyone's workload.
+- **Workers** see tasks assigned to them *plus tasks they filed themselves*. A
+  worker who reports a problem should not lose sight of it merely because it
+  has not been routed to them yet.
+
+Filters apply **inside** that scope, never around it. A worker filtering by
+another person's `assignee_id` receives an empty page — the truthful answer,
+"nothing you can see matches" — rather than silently getting their own tasks
+back, which would be actively misleading. `total` is likewise scoped, so it
+cannot disclose how much work exists team-wide.
+
+### Pagination
+
+Offset/limit with an envelope:
+
+```json
+{"items": [...], "total": 25, "limit": 20, "offset": 0}
+```
+
+`limit` defaults to 20 and is capped at 100 — without a ceiling, `limit=1000000`
+is a denial-of-service lever. Results are ordered newest-first, with `id`
+breaking ties on `created_at`; without that tiebreak, two tasks sharing a
+timestamp can be duplicated or skipped across page boundaries. There is a test
+that pages through the whole set and asserts every row appears exactly once.
+
+Cursor pagination would be better at scale — it does not drift when rows are
+inserted mid-browse, and it does not slow down as the offset grows — but it
+cannot answer "how many are there" cheaply, and it is more machinery than this
+dataset justifies. Noted as an evolution point.
+
 ### Planned
 
 | Method | Path | Who |
 |---|---|---|
-| `POST` | `/tasks` | any caller |
-| `GET` | `/tasks` | scoped by role |
-| `GET` | `/tasks/{id}` | creator, assignee, or any manager |
 | `POST` | `/tasks/{id}/assign` | managers |
 | `POST` | `/tasks/{id}/start` | assignee |
 | `POST` | `/tasks/{id}/complete` | assignee |
@@ -317,6 +368,14 @@ timeout cannot distinguish "already applied" from "out of order". It is
 mitigated by returning `current_status` in the 409 body so the client can
 reconcile; the production answer is `Idempotency-Key` dedup, noted below.
 
+### Business rules live in a service layer
+
+`app/services/tasks.py` holds everything that decides what is allowed; the
+routers translate HTTP to service calls and back. Two reasons: the rules are
+testable without an HTTP layer, and a rule enforced in one place cannot be
+forgotten by a second endpoint that touches the same data. Services raise typed
+`AppError`s and never construct responses.
+
 ### Timestamps are UTC, explicitly
 
 SQLite has no native timezone support, so values written through a plain
@@ -349,11 +408,15 @@ app/
   models/                    SQLAlchemy models (one per file)
   schemas/                   Pydantic request/response models
   routers/                   HTTP endpoints, thin over the service layer
+  services/                  business rules, independent of HTTP
 tests/
   conftest.py                in-memory DB and fixtures shared by all tests
   test_auth_and_errors.py    identity, role guards, error envelope
   test_seed.py               demo data obeys the domain invariants
   test_users.py              user endpoints
+  test_task_creation.py      creating tasks and input validation
+  test_task_visibility.py    who can see which tasks
+  test_pagination.py         paging, and that it cannot widen scope
   test_health.py
 ```
 
@@ -401,6 +464,13 @@ Currently covered:
   timestamps, and assignees always being workers
 - User endpoints: identity resolution, role filtering, and that responses
   expose only the declared fields
+- Task creation: role independence, that a task cannot be created pre-assigned,
+  title trimming and blank/overlong rejection, and response field shape
+- Visibility: manager sees all, worker sees own-and-filed only, scoped `total`,
+  filters narrowing rather than widening scope, and that a hidden task's 404 is
+  indistinguishable from a missing one
+- Pagination: default and explicit windows, full coverage with no duplicate or
+  skipped rows, scope preserved across pages, and rejected out-of-range bounds
 
 Tests run against the real application with the database dependency swapped for
 an in-memory one. `TestClient` is deliberately used *without* its context
@@ -417,10 +487,10 @@ the developer's real `app.db` during a test run.
 | Identity, role guards, error envelope | done |
 | Seed data | done |
 | User endpoints | done |
-| Task create / list / detail with role scoping | not started |
+| Task create / list / detail with role scoping | done |
 | Assignment + notification abstraction | not started |
 | Lifecycle transitions (start / complete / release) | not started |
-| Pagination | not started |
+| Pagination | done |
 | Real SMTP delivery | not started (deliberately last) |
 
 ---

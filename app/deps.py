@@ -8,14 +8,16 @@ reach the service can claim to be anyone. Authorization, by contrast, is real:
 every rule below is enforced server-side and covered by tests.
 """
 
+from dataclasses import dataclass
 from typing import Annotated
 
-from fastapi import Depends, Header
+from fastapi import Depends, Header, Query
 from sqlalchemy.orm import Session
 
 from app.db import get_db
 from app.exceptions import ForbiddenError, UnauthenticatedError
 from app.models import User, UserRole
+from app.schemas.pagination import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
 
 USER_ID_HEADER = "X-User-Id"
 
@@ -90,3 +92,27 @@ def require_worker(user: CurrentUser) -> User:
 
 ManagerUser = Annotated[User, Depends(require_manager)]
 WorkerUser = Annotated[User, Depends(require_worker)]
+
+
+@dataclass(frozen=True)
+class PageParams:
+    limit: int
+    offset: int
+
+
+def page_params(
+    limit: Annotated[
+        int,
+        Query(ge=1, le=MAX_PAGE_SIZE, description="Rows per page."),
+    ] = DEFAULT_PAGE_SIZE,
+    offset: Annotated[int, Query(ge=0, description="Rows to skip.")] = 0,
+) -> PageParams:
+    """Shared paging bounds.
+
+    `le=MAX_PAGE_SIZE` matters: without a ceiling, a caller could request
+    limit=1000000 and turn a list endpoint into a denial-of-service lever.
+    """
+    return PageParams(limit=limit, offset=offset)
+
+
+Pagination = Annotated[PageParams, Depends(page_params)]
