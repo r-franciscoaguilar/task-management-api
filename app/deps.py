@@ -18,6 +18,7 @@ from app.db import get_db
 from app.exceptions import ForbiddenError, UnauthenticatedError
 from app.models import User, UserRole
 from app.schemas.pagination import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
+from app.services.notifications import NotificationSender, get_notification_sender
 
 USER_ID_HEADER = "X-User-Id"
 
@@ -116,3 +117,6 @@ def page_params(
 
 
 Pagination = Annotated[PageParams, Depends(page_params)]
+
+
+Sender = Annotated[NotificationSender, Depends(get_notification_sender)]

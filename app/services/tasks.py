@@ -8,11 +8,33 @@ touches the same data.
 These functions raise AppError subclasses and never build HTTP responses.
 """
 
+import logging
+
 from sqlalchemy import ColumnElement, func, or_, select
 from sqlalchemy.orm import Session
 
-from app.exceptions import NotFoundError
-from app.models import Task, TaskStatus, User, UserRole
+from app.core.time import utcnow
+from app.exceptions import (
+    ConflictError,
+    InvalidStateTransitionError,
+    NotFoundError,
+    ValidationError,
+)
+from app.models import (
+    AssignmentEvent,
+    NotificationStatus,
+    StatusChangeEvent,
+    Task,
+    TaskStatus,
+    User,
+    UserRole,
+)
+from app.services.notifications import (
+    NotificationSender,
+    build_assignment_email,
+)
+
+logger = logging.getLogger(__name__)
 
 
 def create_task(
@@ -107,3 +129,158 @@ def get_task(session: Session, *, caller: User, task_id: int) -> Task:
     if task is None or not may_view(caller, task):
         raise NotFoundError(f"No task with id {task_id} is available to you.")
     return task
+
+
+def list_assignments(
+    session: Session, *, caller: User, task_id: int
+) -> list[AssignmentEvent]:
+    """The assignment history of one task, newest first.
+
+    Goes through get_task so the same visibility rule applies: a caller who may
+    not see the task may not see who it has been given to either.
+    """
+    task = get_task(session, caller=caller, task_id=task_id)
+    return list(task.assignment_events)
+
+
+def assign_task(
+    session: Session,
+    *,
+    caller: User,
+    task_id: int,
+    assignee_id: int,
+    sender: NotificationSender,
+) -> Task:
+    """Put a worker on the hook for a task, and tell them.
+
+    Only reachable by a manager (enforced at the route). Allowed while a task is
+    UNASSIGNED or ASSIGNED -- a manager may redirect work that has not been
+    picked up yet, but not work already in progress; for that the assignee must
+    release it first, which records why.
+    """
+    task = get_task(session, caller=caller, task_id=task_id)
+
+    if task.status not in (TaskStatus.UNASSIGNED, TaskStatus.ASSIGNED):
+        raise InvalidStateTransitionError(
+            "Work already under way cannot be reassigned. The assignee must "
+            "release it first, which records the reason.",
+            current_status=task.status.value,
+        )
+
+    assignee = session.get(User, assignee_id)
+    if assignee is None:
+        raise NotFoundError(f"No user with id {assignee_id} exists.")
+
+    if assignee.role is not UserRole.WORKER:
+        # 422 rather than 404: the user exists, but is not a valid assignee.
+        raise ValidationError(
+            f"{assignee.name} is a manager. Work is assigned to people who do "
+            "the work.",
+            error_code="invalid_assignee",
+            assignee_id=assignee_id,
+            assignee_role=assignee.role.value,
+        )
+
+    if task.assignee_id == assignee.id:
+        # Rejected rather than treated as a nudge, because every assignment
+        # sends a real email: a double-submitted request would otherwise mail
+        # the same person twice. A deliberate "resend notification" action
+        # would be the right way to nudge, and is noted as future work.
+        raise ConflictError(
+            f"Task {task.id} is already assigned to {assignee.name}.",
+            error_code="already_assigned",
+            assignee_id=assignee_id,
+        )
+
+    previous_status = task.status
+    now = utcnow()
+
+    # Assign the relationship, not the raw foreign key. Setting assignee_id
+    # alone leaves an already-loaded `assignee` stale, and because sessions here
+    # use expire_on_commit=False that stale value survives the commit and gets
+    # serialized -- reporting a freshly assigned task as having no assignee.
+    task.assignee = assignee
+    task.status = TaskStatus.ASSIGNED
+    task.assigned_at = now
+    task.updated_at = now
+
+    event = AssignmentEvent(
+        task=task,
+        assigned_by=caller,
+        assigned_to=assignee,
+        assigned_at=now,
+        notification_status=NotificationStatus.PENDING,
+    )
+    session.add(event)
+
+    # A reassignment moves ownership without moving status, so it records no
+    # status change. This asymmetry is why assignment and lifecycle history are
+    # separate tables.
+    if previous_status is not TaskStatus.ASSIGNED:
+        session.add(
+            StatusChangeEvent(
+                task=task,
+                from_status=previous_status,
+                to_status=TaskStatus.ASSIGNED,
+                changed_by=caller,
+                changed_at=now,
+            )
+        )
+
+    # Committed *before* attempting delivery, on purpose. If the process dies
+    # mid-send, the record survives as PENDING -- an assignment whose
+    # notification is unaccounted for, which is visible and can be retried.
+    # Sending first and recording after would lose that entirely.
+    session.commit()
+
+    _notify_assignee(
+        session,
+        sender=sender,
+        event=event,
+        task=task,
+        assignee=assignee,
+        by=caller,
+    )
+    return task
+
+
+def _notify_assignee(
+    session: Session,
+    *,
+    sender: NotificationSender,
+    event: AssignmentEvent,
+    task: Task,
+    assignee: User,
+    by: User,
+) -> None:
+    """Attempt delivery and record the outcome on the assignment record.
+
+    Delivery failure never rolls back the assignment: who is responsible for
+    work must not depend on an email server being reachable. But the failure is
+    not silent either -- it is stored on the event, served by the API, and
+    logged.
+
+    Every exception is caught, not just NotificationSendError. The assignment is
+    already committed at this point, so letting an unexpected error escape would
+    return 500 to a client whose request actually succeeded, and leave the
+    notification recorded as PENDING forever. Recording FAILED with the message
+    is both more honest and more useful.
+    """
+    try:
+        sender.send(build_assignment_email(task=task, assignee=assignee, assigned_by=by))
+    except Exception as error:  # noqa: BLE001 -- see docstring
+        logger.warning(
+            "Assignment notification failed for task %s to %s: %s",
+            task.id,
+            assignee.email,
+            error,
+        )
+        event.notification_status = NotificationStatus.FAILED
+        event.notification_error = str(error) or error.__class__.__name__
+        event.notification_sent_at = None
+    else:
+        event.notification_status = NotificationStatus.SENT
+        event.notification_sent_at = utcnow()
+        event.notification_error = None
+
+    session.commit()

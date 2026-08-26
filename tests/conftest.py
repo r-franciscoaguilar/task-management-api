@@ -17,6 +17,7 @@ from sqlalchemy.pool import StaticPool
 from app.core.time import utcnow
 from app.db import Base
 from app.models import Task, TaskStatus, User, UserRole
+from app.services.notifications import EmailMessage, NotificationSendError
 
 
 @pytest.fixture()
@@ -79,9 +80,36 @@ def auth(user: User) -> dict[str, str]:
     return {"X-User-Id": str(user.id)}
 
 
+class RecordingSender:
+    """A notification sender that remembers what it was asked to send.
+
+    Set `fail_with` to make delivery raise, which is how the tests prove the
+    system stays correct when email is broken -- the case that matters most and
+    is impossible to exercise with the real sender.
+    """
+
+    def __init__(self) -> None:
+        self.sent: list[EmailMessage] = []
+        self.fail_with: Exception | None = None
+
+    def send(self, message: EmailMessage) -> None:
+        self.sent.append(message)
+        if self.fail_with is not None:
+            raise self.fail_with
+
+    def fail(self, message: str = "SMTP connection refused") -> None:
+        self.fail_with = NotificationSendError(message)
+
+
+@pytest.fixture()
+def sender() -> RecordingSender:
+    return RecordingSender()
+
+
 @pytest.fixture()
 def client(
     override_get_db: Callable[[], Generator[Session, None, None]],
+    sender: RecordingSender,
 ) -> Iterator[TestClient]:
     """The real application, wired to the test database.
 
@@ -93,8 +121,10 @@ def client(
     """
     from app.db import get_db
     from app.main import app
+    from app.services.notifications import get_notification_sender
 
     app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[get_notification_sender] = lambda: sender
     try:
         yield TestClient(app)
     finally:

@@ -7,10 +7,11 @@ about who may do what lives in app/services/tasks.py.
 from fastapi import APIRouter, Query, status
 from sqlalchemy import select
 
-from app.deps import CurrentUser, DbSession, Pagination
-from app.models import Task, TaskStatus
+from app.deps import CurrentUser, DbSession, ManagerUser, Pagination, Sender
+from app.models import AssignmentEvent, Task, TaskStatus
+from app.schemas.assignment_event import AssignmentEventOut
 from app.schemas.pagination import Page
-from app.schemas.task import TaskCreate, TaskOut
+from app.schemas.task import AssignRequest, TaskCreate, TaskDetailOut, TaskOut
 from app.services import tasks as task_service
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
@@ -69,7 +70,65 @@ def list_tasks(
     )
 
 
-@router.get("/{task_id}", response_model=TaskOut, summary="Get one task")
-def get_task(task_id: int, db: DbSession, caller: CurrentUser) -> Task:
-    """Fetch a task the caller is entitled to see, otherwise 404."""
-    return task_service.get_task(db, caller=caller, task_id=task_id)
+@router.get("/{task_id}", response_model=TaskDetailOut, summary="Get one task")
+def get_task(task_id: int, db: DbSession, caller: CurrentUser) -> TaskDetailOut:
+    """Fetch a task the caller is entitled to see, otherwise 404.
+
+    Includes the most recent assignment so that whether the assignee was
+    actually notified is visible where a human looks, not only via the history
+    endpoint.
+    """
+    task = task_service.get_task(db, caller=caller, task_id=task_id)
+    detail = TaskDetailOut.model_validate(task)
+    if task.assignment_events:
+        detail.latest_assignment = AssignmentEventOut.model_validate(
+            task.assignment_events[0]  # relationship is ordered newest-first
+        )
+    return detail
+
+
+@router.post(
+    "/{task_id}/assign",
+    response_model=TaskDetailOut,
+    summary="Assign a task to a worker",
+)
+def assign_task(
+    task_id: int,
+    payload: AssignRequest,
+    db: DbSession,
+    caller: ManagerUser,
+    sender: Sender,
+) -> TaskDetailOut:
+    """Make a worker responsible for a task, and email them.
+
+    Managers only. Permitted while the task is UNASSIGNED or ASSIGNED; work
+    already in progress must be released by its assignee first.
+    """
+    task = task_service.assign_task(
+        db,
+        caller=caller,
+        task_id=task_id,
+        assignee_id=payload.assignee_id,
+        sender=sender,
+    )
+    detail = TaskDetailOut.model_validate(task)
+    detail.latest_assignment = AssignmentEventOut.model_validate(
+        task.assignment_events[0]
+    )
+    return detail
+
+
+@router.get(
+    "/{task_id}/assignments",
+    response_model=list[AssignmentEventOut],
+    summary="Assignment and notification history",
+)
+def list_assignments(
+    task_id: int, db: DbSession, caller: CurrentUser
+) -> list[AssignmentEvent]:
+    """Every assignment this task has had, newest first.
+
+    Includes whether each notification was delivered, which is what makes the
+    traceability requirement checkable rather than assumed.
+    """
+    return task_service.list_assignments(db, caller=caller, task_id=task_id)

@@ -8,9 +8,11 @@ Built for the Software Engineer III take-home assessment. **Backend only** —
 there is no frontend, and other systems are expected to integrate with this API.
 
 > **Build status:** in progress, implemented step by step.
-> Done: data model, identity/authorization layer, error handling, demo data,
-> user endpoints, task creation/listing/detail with role scoping and pagination.
-> Not yet: assignment, lifecycle transitions, real email delivery.
+> Done: data model, identity/authorization, error handling, demo data, user
+> endpoints, task create/list/detail with scoping and pagination, assignment
+> with its notification trail.
+> **Not yet: lifecycle transitions (start/complete/release), and real SMTP
+> delivery — the shipped sender is a no-op.**
 > See [Implementation status](#implementation-status) for the current state.
 
 ---
@@ -228,7 +230,9 @@ the shapes described under [Design notes](#design-notes).
 | `GET` | `/users` | any caller | Optional `?role=MANAGER\|WORKER` filter (uppercase) |
 | `POST` | `/tasks` | any caller | `{title, description?}` → 201, always starts `UNASSIGNED` |
 | `GET` | `/tasks` | scoped | `?status=&assignee_id=&creator_id=&limit=&offset=` |
-| `GET` | `/tasks/{id}` | scoped | 404 if the caller may not see it |
+| `GET` | `/tasks/{id}` | scoped | 404 if the caller may not see it; includes `latest_assignment` |
+| `POST` | `/tasks/{id}/assign` | managers | `{assignee_id}` — notifies the assignee |
+| `GET` | `/tasks/{id}/assignments` | scoped | Assignment and notification history, newest first |
 
 `GET /users` returns a plain array rather than the paginated envelope planned
 for tasks. Users are a small bounded reference set; the brief asks specifically
@@ -278,15 +282,35 @@ inserted mid-browse, and it does not slow down as the offset grows — but it
 cannot answer "how many are there" cheaply, and it is more machinery than this
 dataset justifies. Noted as an evolution point.
 
+### Assignment rules
+
+`POST /tasks/{id}/assign` is managers-only and rejects in four distinct ways, so
+a client can tell the cases apart:
+
+| Situation | Status | `error` |
+|---|---|---|
+| Caller is a worker | 403 | `manager_role_required` |
+| No such user | 404 | `not_found` |
+| Assignee is a manager | 422 | `invalid_assignee` |
+| Already assigned to that person | 409 | `already_assigned` |
+| Task is `IN_PROGRESS` or `DONE` | 409 | `invalid_state_transition` |
+
+Assigning to a manager is 422 rather than 404 because the user *does* exist —
+they are simply not someone work is given to.
+
+Re-assigning to the person who already holds the task is rejected rather than
+treated as a nudge, because **every assignment sends a real email**: a
+double-submitted request would otherwise mail the same person twice. A separate
+"resend notification" action would be the right way to nudge someone, and is
+listed as future work.
+
 ### Planned
 
 | Method | Path | Who |
 |---|---|---|
-| `POST` | `/tasks/{id}/assign` | managers |
 | `POST` | `/tasks/{id}/start` | assignee |
 | `POST` | `/tasks/{id}/complete` | assignee |
 | `POST` | `/tasks/{id}/release` | assignee, reason required |
-| `GET` | `/tasks/{id}/assignments` | scoped |
 | `GET` | `/tasks/{id}/history` | scoped |
 
 ---
@@ -368,6 +392,49 @@ timeout cannot distinguish "already applied" from "out of order". It is
 mitigated by returning `current_status` in the 409 body so the client can
 reconcile; the production answer is `Idempotency-Key` dedup, noted below.
 
+### Assignments and notifications
+
+**Current state, stated plainly: the shipped sender does no I/O.** Real SMTP
+delivery is the last item on the build list, so the brief's requirement that an
+assignee "must receive a real email" is *not yet met*. What is built is the
+structure around it — everything except the socket.
+
+`NotificationSender` is a protocol with one method. `NoopEmailSender` implements
+it today; a real `SmtpEmailSender` will implement it later, and swapping them
+means returning a different object from `get_notification_sender()` and changing
+nothing else. Because the sender is a **FastAPI dependency** rather than a
+direct call, tests inject a sender that fails on demand — which is how the
+failure path below is actually proven rather than asserted.
+
+The ordering inside `assign_task` is the design:
+
+1. Authorize, validate the assignee, and check the lifecycle allows it.
+2. Update the task, and insert an `AssignmentEvent` with
+   `notification_status = PENDING`.
+3. **Commit.** The audit record now exists, before any delivery is attempted.
+4. Attempt delivery. Success records `SENT` plus a timestamp; failure records
+   `FAILED` plus the error text. Commit again.
+
+Committing *before* sending is deliberate. If the process dies mid-send, the
+record survives as `PENDING` — an assignment whose notification is unaccounted
+for, which is visible and can be retried. Sending first and recording after
+would lose that entirely.
+
+**A failed email never rolls back the assignment.** Who is responsible for work
+must not depend on a mail server being reachable. But the failure is not silent:
+it is stored on the event, returned by the API, and logged. Seeded task 7
+demonstrates this — `notification_status: FAILED` with the error text, and the
+assignment standing.
+
+Every exception is caught during delivery, not only `NotificationSendError`. By
+that point the assignment is committed, so letting an unexpected error escape
+would return 500 for a request that actually succeeded, and leave the
+notification stuck at `PENDING`.
+
+The trade-off: delivery is synchronous, so a slow mail server slows the request.
+A production system would hand this to a background worker with retries — see
+[Evolution](#evolution).
+
 ### Business rules live in a service layer
 
 `app/services/tasks.py` holds everything that decides what is allowed; the
@@ -408,7 +475,9 @@ app/
   models/                    SQLAlchemy models (one per file)
   schemas/                   Pydantic request/response models
   routers/                   HTTP endpoints, thin over the service layer
-  services/                  business rules, independent of HTTP
+  services/
+    tasks.py                 lifecycle and visibility rules
+    notifications.py         sender protocol, no-op sender, message building
 tests/
   conftest.py                in-memory DB and fixtures shared by all tests
   test_auth_and_errors.py    identity, role guards, error envelope
@@ -417,6 +486,7 @@ tests/
   test_task_creation.py      creating tasks and input validation
   test_task_visibility.py    who can see which tasks
   test_pagination.py         paging, and that it cannot widen scope
+  test_assignment.py         assigning, reassigning, and notification outcomes
   test_health.py
 ```
 
@@ -471,6 +541,12 @@ Currently covered:
   indistinguishable from a missing one
 - Pagination: default and explicit windows, full coverage with no duplicate or
   skipped rows, scope preserved across pages, and rejected out-of-range bounds
+- Assignment: the happy path end to end, all five rejection cases, reassignment
+  appending history rather than overwriting, and that a reassignment records no
+  status change
+- Notification failure: the assignment survives, the failure is recorded with
+  its error text, an *undeclared* exception type is handled the same way, and no
+  email is attempted when authorization or validation fails
 
 Tests run against the real application with the database dependency swapped for
 an in-memory one. `TestClient` is deliberately used *without* its context
@@ -488,10 +564,48 @@ the developer's real `app.db` during a test run.
 | Seed data | done |
 | User endpoints | done |
 | Task create / list / detail with role scoping | done |
-| Assignment + notification abstraction | not started |
+| Assignment + notification abstraction | done (real SMTP still pending) |
 | Lifecycle transitions (start / complete / release) | not started |
 | Pagination | done |
 | Real SMTP delivery | not started (deliberately last) |
+
+---
+
+## Evolution
+
+Known gaps, in rough priority order. These are deliberate scope decisions, not
+oversights.
+
+**Before this could be called production-ready**
+
+- **Real authentication.** `X-User-Id` is a stand-in; anyone reaching the
+  service can claim to be anyone. Replace with a verified token — one
+  dependency function changes.
+- **Real email delivery.** The last build step; the sender interface is already
+  in place.
+- **Asynchronous notification with retries.** Delivery is currently synchronous
+  and single-attempt, so a slow mail server slows the request and a transient
+  failure needs manual intervention. An outbox plus a background worker would
+  fix both, and the `PENDING` state already exists for it.
+- **Migrations.** `create_all()` cannot evolve a schema that already holds data.
+  Alembic before the first real deployment.
+- **Idempotency keys.** Transitions are deliberately non-idempotent, which
+  leaves a client unable to distinguish "already applied" from "out of order"
+  after a timeout. An `Idempotency-Key` header with server-side dedup is the
+  proper fix.
+
+**If the team or the workload grew**
+
+- **Postgres instead of SQLite**, for concurrent writes and real indexing.
+- **Cursor pagination** for the task list; offset paging drifts when rows are
+  inserted mid-browse and degrades as the offset grows.
+- **A resend-notification action**, so nudging someone does not require the
+  reassignment path.
+- **Task editing and cancellation.** Neither is in the brief, but real
+  operations teams need to correct a title and abandon obsolete work.
+- **Richer queues** — due dates, priority, and filtering or sorting on them,
+  which is what "supervisors have no single place to see what is in flight"
+  eventually demands.
 
 ---
 

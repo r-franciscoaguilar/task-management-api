@@ -5,6 +5,7 @@ from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.models import TaskStatus
+from app.schemas.assignment_event import AssignmentEventOut
 from app.schemas.user import UserOut
 
 
@@ -57,3 +58,19 @@ class TaskOut(BaseModel):
     updated_at: datetime
     assigned_at: datetime | None
     completed_at: datetime | None
+
+
+class TaskDetailOut(TaskOut):
+    """A single task, including its most recent assignment.
+
+    Only the detail endpoint carries this. Adding it to list responses would
+    mean loading assignment history for every row -- an N+1 query per page -- so
+    lists stay lean and the full trail is available at
+    GET /tasks/{id}/assignments.
+    """
+
+    latest_assignment: AssignmentEventOut | None = None
+
+
+class AssignRequest(BaseModel):
+    assignee_id: int = Field(description="Id of the worker to make responsible.")
