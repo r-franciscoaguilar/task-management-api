@@ -9,6 +9,7 @@ app, the fixtures, and the assertions alike.
 from collections.abc import Callable, Generator, Iterator
 
 import pytest
+from fastapi.testclient import TestClient
 from sqlalchemy import Engine, create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -75,3 +76,25 @@ def users(db: Session) -> dict[str, User]:
 def auth(user: User) -> dict[str, str]:
     """Headers that identify `user` as the caller."""
     return {"X-User-Id": str(user.id)}
+
+
+@pytest.fixture()
+def client(
+    override_get_db: Callable[[], Generator[Session, None, None]],
+) -> Iterator[TestClient]:
+    """The real application, wired to the test database.
+
+    TestClient is used *without* its context manager on purpose. Entering the
+    context would run the app's lifespan, which calls create_all and
+    seed_if_empty against the real engine -- writing to the developer's app.db
+    from a test run. Tables here are created by the `engine` fixture instead,
+    and tests arrange their own data.
+    """
+    from app.db import get_db
+    from app.main import app
+
+    app.dependency_overrides[get_db] = override_get_db
+    try:
+        yield TestClient(app)
+    finally:
+        app.dependency_overrides.clear()
