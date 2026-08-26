@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from app import models
 from app.db import Base, SessionLocal, engine
 from app.exceptions import register_exception_handlers
+from app.routers import users
 from app.seed import seed_if_empty
 
 
@@ -27,6 +28,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
 app = FastAPI(title="Task Management API", lifespan=lifespan)
 register_exception_handlers(app)
+app.include_router(users.router)
 
 
 @app.get("/health")

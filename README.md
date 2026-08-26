@@ -8,8 +8,9 @@ Built for the Software Engineer III take-home assessment. **Backend only** —
 there is no frontend, and other systems are expected to integrate with this API.
 
 > **Build status:** in progress, implemented step by step.
-> Done: data model, identity/authorization layer, error handling, demo data.
-> Not yet: the HTTP endpoints and real email delivery.
+> Done: data model, identity/authorization layer, error handling, demo data,
+> user endpoints.
+> Not yet: task endpoints and real email delivery.
 > See [Implementation status](#implementation-status) for the current state.
 
 ---
@@ -159,11 +160,17 @@ reassigning it moved ownership while the status stayed `ASSIGNED`.
 Every request identifies its caller by header:
 
 ```bash
-curl -s localhost:8000/tasks -H 'X-User-Id: 1'   # as Alice, a manager
-curl -s localhost:8000/tasks -H 'X-User-Id: 3'   # as Carol, a worker
+curl -s localhost:8000/users/me -H 'X-User-Id: 1'   # as Alice, a manager
+curl -s localhost:8000/users/me -H 'X-User-Id: 3'   # as Carol, a worker
 ```
 
-A full walkthrough will be added here once the endpoints exist.
+Omitting the header is a 401, as is an unknown or non-numeric id:
+
+```json
+{"error": "unauthenticated", "message": "Missing X-User-Id header. Every request must identify the acting user."}
+```
+
+A full task walkthrough will be added here once those endpoints exist.
 
 ### How the demo data is built, and why it matters
 
@@ -188,6 +195,48 @@ assignees are always workers. They already caught one real bug: a freshly
 constructed `Task` has `status = None` until it is flushed, because column
 defaults are applied on INSERT rather than in `__init__`, so the first version
 of the seed recorded a status change *from* nothing.
+
+---
+
+## API
+
+Every endpoint requires the `X-User-Id` header. Responses and errors all use
+the shapes described under [Design notes](#design-notes).
+
+### Implemented
+
+| Method | Path | Who | Notes |
+|---|---|---|---|
+| `GET` | `/health` | anyone | Liveness check; no identity required |
+| `GET` | `/users/me` | any caller | The caller's own record and role |
+| `GET` | `/users` | any caller | Optional `?role=MANAGER\|WORKER` filter (uppercase) |
+
+`GET /users` returns a plain array rather than the paginated envelope planned
+for tasks. Users are a small bounded reference set; the brief asks specifically
+for a practical way to browse *work items* as they grow.
+
+Both roles can read the directory. A manager needs it to choose an assignee,
+and it is a small non-sensitive set, so restricting it would add friction
+without protecting anything meaningful here. In a production system this would
+likely be narrowed — manager-only, or excluding email addresses.
+
+Response models are explicit rather than derived from the ORM, so adding a
+column to a model can never silently leak it into an API response. There is a
+test asserting exactly that.
+
+### Planned
+
+| Method | Path | Who |
+|---|---|---|
+| `POST` | `/tasks` | any caller |
+| `GET` | `/tasks` | scoped by role |
+| `GET` | `/tasks/{id}` | creator, assignee, or any manager |
+| `POST` | `/tasks/{id}/assign` | managers |
+| `POST` | `/tasks/{id}/start` | assignee |
+| `POST` | `/tasks/{id}/complete` | assignee |
+| `POST` | `/tasks/{id}/release` | assignee, reason required |
+| `GET` | `/tasks/{id}/assignments` | scoped |
+| `GET` | `/tasks/{id}/history` | scoped |
 
 ---
 
@@ -298,10 +347,13 @@ app/
     config.py                environment-backed settings
     time.py                  utcnow() and the UtcDateTime column type
   models/                    SQLAlchemy models (one per file)
+  schemas/                   Pydantic request/response models
+  routers/                   HTTP endpoints, thin over the service layer
 tests/
   conftest.py                in-memory DB and fixtures shared by all tests
   test_auth_and_errors.py    identity, role guards, error envelope
   test_seed.py               demo data obeys the domain invariants
+  test_users.py              user endpoints
   test_health.py
 ```
 
@@ -347,6 +399,13 @@ Currently covered:
 - Demo data integrity: unbroken status history, assignee agreeing with the
   newest assignment record, reasons present on backward moves only, completion
   timestamps, and assignees always being workers
+- User endpoints: identity resolution, role filtering, and that responses
+  expose only the declared fields
+
+Tests run against the real application with the database dependency swapped for
+an in-memory one. `TestClient` is deliberately used *without* its context
+manager: entering it would run the app's lifespan, which would create and seed
+the developer's real `app.db` during a test run.
 
 ---
 
@@ -357,7 +416,7 @@ Currently covered:
 | Data model (users, tasks, assignment + status-change events) | done |
 | Identity, role guards, error envelope | done |
 | Seed data | done |
-| User endpoints | not started |
+| User endpoints | done |
 | Task create / list / detail with role scoping | not started |
 | Assignment + notification abstraction | not started |
 | Lifecycle transitions (start / complete / release) | not started |
