@@ -8,12 +8,9 @@ Built for the Software Engineer III take-home assessment. **Backend only** —
 there is no frontend, and other systems are expected to integrate with this API.
 
 > **Build status:** in progress, implemented step by step.
-> Done: the full workflow — data model, identity/authorization, error handling,
-> demo data, task creation, scoped listing with pagination, assignment with its
-> notification trail, and the complete lifecycle including the audited
-> backward transition.
-> **Not yet: real SMTP delivery — the shipped sender is a no-op — and the
-> reflection answers below.**
+> **Complete.** The full workflow is implemented and tested, including real
+> SMTP delivery of assignment emails. See
+> [Implementation status](#implementation-status).
 > See [Implementation status](#implementation-status) for the current state.
 
 ---
@@ -27,10 +24,27 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
 cp .env.example .env
-
-uvicorn app.main:app --reload      # http://127.0.0.1:8000
-pytest -q                          # run the test suite
 ```
+
+Assignment emails are really sent, so run a local mail catcher in one terminal
+and the API in another. No mail account is needed.
+
+```bash
+# terminal 1 — catches the emails and prints them
+python -m aiosmtpd -n -l localhost:1025
+
+# terminal 2 — the API
+uvicorn app.main:app --reload      # http://127.0.0.1:8000
+```
+
+```bash
+pytest -q                          # 156 tests, ~2 seconds
+```
+
+Assign a task and the message appears in terminal 1. If nothing is listening on
+port 1025, assignments still succeed but their notification is recorded as
+`FAILED` with the reason — which is the designed behaviour, not a crash. See
+[Email delivery](#email-delivery) for pointing it at a real inbox.
 
 Interactive API docs are at `http://127.0.0.1:8000/docs` once running.
 
@@ -472,17 +486,16 @@ reconcile; the production answer is `Idempotency-Key` dedup, noted below.
 
 ### Assignments and notifications
 
-**Current state, stated plainly: the shipped sender does no I/O.** Real SMTP
-delivery is the last item on the build list, so the brief's requirement that an
-assignee "must receive a real email" is *not yet met*. What is built is the
-structure around it — everything except the socket.
+Assignment emails are **really sent**, over SMTP, using the standard library.
+`SmtpEmailSender` is the default; `NoopEmailSender` exists only for
+deliberately switching email off (`EMAIL_BACKEND=noop`) and is never the
+default — a no-op default would record every notification as `SENT` while
+nothing was delivered, which is worse than failing loudly.
 
-`NotificationSender` is a protocol with one method. `NoopEmailSender` implements
-it today; a real `SmtpEmailSender` will implement it later, and swapping them
-means returning a different object from `get_notification_sender()` and changing
-nothing else. Because the sender is a **FastAPI dependency** rather than a
-direct call, tests inject a sender that fails on demand — which is how the
-failure path below is actually proven rather than asserted.
+`NotificationSender` is a protocol with one method, resolved as a **FastAPI
+dependency**. That is what lets tests inject a sender that fails on demand, so
+the failure path below is proven rather than asserted — a case that cannot be
+exercised against a working mail server.
 
 The ordering inside `assign_task` is the design:
 
@@ -509,9 +522,146 @@ that point the assignment is committed, so letting an unexpected error escape
 would return 500 for a request that actually succeeded, and leave the
 notification stuck at `PENDING`.
 
-The trade-off: delivery is synchronous, so a slow mail server slows the request.
-A production system would hand this to a background worker with retries — see
-[Evolution](#evolution).
+The trade-off: delivery is synchronous and single-attempt, so a slow mail server
+slows the request and a transient failure needs manual intervention. A
+connection is also opened per message. The fix is not connection pooling but
+moving delivery off the request path entirely — see [Evolution](#evolution).
+`SMTP_TIMEOUT` (default 10s) bounds the damage in the meantime; without it an
+unresponsive server would hang the request thread indefinitely.
+
+### Email delivery
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `EMAIL_BACKEND` | `smtp` | `smtp` delivers for real; `noop` discards without sending |
+| `SMTP_HOST` / `SMTP_PORT` | `localhost` / `1025` | Where to deliver |
+| `SMTP_USERNAME` / `SMTP_PASSWORD` | empty | Sent only if both are set |
+| `SMTP_FROM_ADDRESS` | `noreply@task-api.local` | Envelope sender |
+| `SMTP_USE_TLS` | `false` | STARTTLS after connecting |
+| `SMTP_TIMEOUT` | `10` | Seconds before giving up |
+| `NOTIFY_OVERRIDE_ADDRESS` | unset | If set, all mail goes here instead of the assignee |
+
+**Locally**, the defaults target a mail catcher on port 1025
+(`python -m aiosmtpd -n -l localhost:1025`), so delivery genuinely crosses a
+socket with no account required.
+
+**Against a real inbox**, point it at a provider:
+
+```bash
+EMAIL_BACKEND=smtp
+SMTP_HOST=smtp.example.com
+SMTP_PORT=587
+SMTP_USERNAME=your-username
+SMTP_PASSWORD=your-password
+SMTP_FROM_ADDRESS=tasks@yourdomain.com
+SMTP_USE_TLS=true
+```
+
+Known limitation: STARTTLS on port 587 is supported; implicit TLS on port 465
+is not, since it needs `SMTP_SSL` rather than `SMTP`.
+
+Every smtplib and socket failure is translated into `NotificationSendError`, so
+callers depend on this module's contract rather than on smtplib's exception
+hierarchy. The stored error names the host and port — "connection refused" alone
+tells an operator nothing about which server was unreachable.
+
+#### Verifying delivery
+
+There is a CLI that sends one message using the current configuration, so SMTP
+settings can be checked without involving the API or the database:
+
+```bash
+python -m app.send_test_email you@example.com
+```
+
+It prints the resolved configuration (never the password) and, on failure, the
+usual causes. Getting this to pass first separates "my credentials are wrong"
+from "the application is wrong" — two problems that are otherwise debugged
+together.
+
+#### What has been verified, and what "SENT" actually means
+
+Delivery has been exercised against a **real external provider** (Mailtrap's
+SMTP sandbox) over port 587, not only against a local catcher. That run
+confirmed the parts a local catcher cannot: STARTTLS negotiation and
+username/password authentication, both of which a catcher skips entirely. An
+assignment made through the HTTP API produced an authenticated, TLS-encrypted
+message addressed to the assignee, which arrived intact.
+
+Also confirmed by a *failure*: pointing the same configuration at Mailtrap's
+production endpoint was rejected with
+`550 Sending from domain task-api.local is not allowed`. That is correct
+behaviour on their side — production senders require a verified sending domain —
+and it is the reason a real deployment needs the DNS work described in
+[Email in production](#email-in-production).
+
+`notification_status = SENT` therefore means **the mail server accepted
+responsibility for the message** — an SMTP `250`. It deliberately does not claim
+delivery to a human inbox, because an application cannot know that from the SMTP
+transaction alone: a message can still bounce, be greylisted, or be filtered
+afterwards. Learning that requires provider webhooks, which is why `SENT` is
+named for what is actually known rather than what is hoped.
+
+**`NOTIFY_OVERRIDE_ADDRESS`** redirects every notification to one address,
+preserving the intended recipient in the subject:
+
+```
+Subject: [to: carol@example.com] Task assigned to you: Replace intake filter on pump 3
+```
+
+That makes it possible to receive real assignment emails at your own inbox
+without editing the seed data, and it is the mechanism a staging deployment
+would use to guarantee it can never email real users. It is applied as a wrapper
+around whichever backend is configured, so it composes rather than complicating
+delivery, and the app logs a warning at startup when it is active — a redirect
+that goes unnoticed makes every notification look delivered while nobody who
+should have received one did.
+
+### Email in production
+
+What is here is a correct, tested delivery path. Running it for real would need
+the following, roughly in order of what would hurt first:
+
+1. **Move delivery off the request path.** An outbox plus a background worker:
+   the `AssignmentEvent` is already written as `PENDING` before any send is
+   attempted, so a worker can claim pending rows, deliver, and update them with
+   **no schema change**. This decouples assignment latency from SMTP and is the
+   prerequisite for everything below.
+2. **Retries with backoff, and a dead-letter path.** Transient failures
+   (timeouts, connection refused, SMTP 4xx) should be retried; permanent ones
+   (SMTP 5xx, malformed address) should not. Today every failure is a single
+   attempt that needs a human.
+3. **A verified sending domain with SPF, DKIM and DMARC.** The current
+   `noreply@task-api.local` is deliberately fake, and a production provider
+   rejects it outright — as we saw. Without DKIM signing and aligned SPF, mail
+   that *is* accepted lands in spam, which is indistinguishable from not sending
+   it at all.
+4. **Secrets management.** Credentials in `.env` are fine on a laptop. Production
+   wants a secret manager with rotation, and care that they never reach logs or
+   crash dumps.
+5. **Bounce and complaint handling.** A provider webhook is the only way to learn
+   that an address is dead or that someone marked the mail as spam. That means a
+   `BOUNCED` state beyond `SENT`, and probably a per-user "email is not
+   deliverable" flag so the team can fix it — otherwise sender reputation decays
+   silently.
+6. **Distinguish accepted from delivered.** With webhooks in place, `SENT`
+   becomes "accepted by the provider" and a separate `DELIVERED` reflects what
+   actually landed. The audit trail then answers the business question — *was
+   this person told?* — rather than the technical one.
+7. **A provider API rather than raw SMTP.** `NotificationSender` makes this a
+   swap rather than a rewrite. HTTP APIs return a message id, which is what
+   correlates a send with its later webhook, and they avoid a TCP and TLS
+   handshake per message.
+8. **Observability with a business-level alert.** Metrics on attempts, failures
+   by reason, and the age of the oldest `PENDING` row. Rising `FAILED` counts
+   mean people are not being told about work assigned to them — a business
+   incident, not a technical curiosity.
+9. **Templates instead of string building, and notification preferences.** Text
+   and HTML alternatives from real templates, with per-user preferences and
+   digests: at team scale, one email per assignment becomes noise people filter
+   away, which quietly defeats the whole feature.
+10. **PII discipline.** The startup and failure logs currently contain email
+    addresses. Production logging should scrub or tokenise them.
 
 ### Business rules live in a service layer
 
@@ -547,6 +697,7 @@ app/
   deps.py                    caller identity (X-User-Id) and role guards
   exceptions.py              AppError hierarchy + the single error envelope
   seed.py                    demo data; also runnable as `python -m app.seed`
+  send_test_email.py         CLI to verify SMTP settings in isolation
   core/
     config.py                environment-backed settings
     time.py                  utcnow() and the UtcDateTime column type
@@ -555,7 +706,7 @@ app/
   routers/                   HTTP endpoints, thin over the service layer
   services/
     tasks.py                 lifecycle and visibility rules
-    notifications.py         sender protocol, no-op sender, message building
+    notifications.py         sender protocol, SMTP sender, message building
 tests/
   conftest.py                in-memory DB and fixtures shared by all tests
   test_auth_and_errors.py    identity, role guards, error envelope
@@ -566,6 +717,7 @@ tests/
   test_pagination.py         paging, and that it cannot widen scope
   test_assignment.py         assigning, reassigning, and notification outcomes
   test_lifecycle.py          transitions, refusals, and the release path
+  test_smtp_delivery.py      real delivery against an in-process SMTP server
   test_health.py
 ```
 
@@ -633,6 +785,15 @@ Currently covered:
 - Release: the reason stored and trimmed, blank and missing reasons rejected,
   the assignee retained, released work restartable, and — the case release was
   added for — a previously unreassignable task becoming reassignable
+- SMTP delivery against a **real in-process SMTP server**: the message arrives
+  with correct envelope, headers and body; a Unicode subject and body survive
+  the round trip; a refused connection and an unresolvable host both become
+  `NotificationSendError` naming the server; and, end to end, assigning through
+  the HTTP API puts a real message on the wire — while a dead mail server leaves
+  the assignment intact and the failure recorded
+- Notification redirect: mail diverted to the override address, the intended
+  recipient preserved in the subject, the body untouched, and the wrapper
+  composing with either backend
 
 Tests run against the real application with the database dependency swapped for
 an in-memory one. `TestClient` is deliberately used *without* its context
@@ -650,10 +811,10 @@ the developer's real `app.db` during a test run.
 | Seed data | done |
 | User endpoints | done |
 | Task create / list / detail with role scoping | done |
-| Assignment + notification abstraction | done (real SMTP still pending) |
+| Assignment + notification abstraction | done |
 | Lifecycle transitions (start / complete / release) | done |
 | Pagination | done |
-| Real SMTP delivery | not started (deliberately last) |
+| Real SMTP delivery | done |
 
 ---
 
@@ -667,8 +828,6 @@ oversights.
 - **Real authentication.** `X-User-Id` is a stand-in; anyone reaching the
   service can claim to be anyone. Replace with a verified token — one
   dependency function changes.
-- **Real email delivery.** The last build step; the sender interface is already
-  in place.
 - **Asynchronous notification with retries.** Delivery is currently synchronous
   and single-attempt, so a slow mail server slows the request and a transient
   failure needs manual intervention. An outbox plus a background worker would
@@ -798,10 +957,22 @@ dependency**. That is what makes the failure path provable: tests inject a
 sender that raises on demand and assert the assignment still stands with the
 failure recorded. You cannot test "email is broken" against a real sender.
 
+Delivery is real: `SmtpEmailSender` uses stdlib `smtplib` and is the default
+backend. Locally the defaults target a mail catcher on port 1025, so a reviewer
+sees actual messages without needing a mail account. Proving this needed a test
+that runs an SMTP server in-process and asserts the message arrives — asserting
+`.send()` was called would say nothing about whether anything left the process.
+
+It has also been run against a real external provider over port 587, which is
+what exercises STARTTLS and SMTP authentication; a local catcher requires
+neither, so those two branches were untested until then. Details, including what
+`SENT` does and does not claim, are under
+[What has been verified](#what-has-been-verified-and-what-sent-actually-means).
+
 The honest limitation: delivery is **synchronous and single-attempt**, so a slow
 mail server slows the request and a transient failure needs manual
-intervention. The `PENDING` state exists precisely so a retry mechanism can be
-added without schema change.
+intervention. `SMTP_TIMEOUT` bounds the damage, and the `PENDING` state exists
+precisely so a retry mechanism can be added without a schema change.
 
 ### How would you evolve this if the team or workload grew?
 
@@ -872,8 +1043,10 @@ Ranked by what would hurt first:
 1. **Real authentication.** Replace the trusted header with a verified token.
    Nothing else about authorization changes — the role checks already run
    server-side.
-2. **Asynchronous notification with retries.** An outbox and a worker, so a
-   `FAILED` send resolves itself instead of needing a human.
+2. **Asynchronous notification with retries**, then the rest of
+   [Email in production](#email-in-production) — a verified sending domain with
+   SPF/DKIM/DMARC, bounce webhooks, and separating "accepted by the provider"
+   from "actually delivered".
 3. **Migrations.** Alembic before the first deployment that holds real data.
 4. **Postgres**, with the transaction and index review that implies.
 5. **Idempotency keys.** Transitions are non-idempotent by design, which leaves

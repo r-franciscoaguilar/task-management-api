@@ -16,6 +16,10 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "httpx>=0.27",
+    # Local SMTP server, used two ways: `python -m aiosmtpd` to watch real
+    # emails arrive during manual testing, and an in-process instance in the
+    # test suite to prove delivery actually crosses a socket.
+    "aiosmtpd>=1.4",
 ]
 
 [build-system]

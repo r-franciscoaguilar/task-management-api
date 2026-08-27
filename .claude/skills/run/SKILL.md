@@ -16,17 +16,24 @@ description: Start the Task Management API locally so it can be exercised manual
    ```bash
    cp .env.example .env
    ```
-3. Start the API:
+3. Assignment emails are really sent, so start a local mail catcher first --
+   otherwise notifications are recorded as FAILED (correct behaviour, but not
+   what you want while developing):
+   ```bash
+   source .venv/bin/activate
+   python -m aiosmtpd -n -l localhost:1025
+   ```
+4. Start the API in a second terminal:
    ```bash
    source .venv/bin/activate
    uvicorn app.main:app --reload
    ```
-4. Verify it's up:
+5. Verify it's up:
    ```bash
    curl http://127.0.0.1:8000/health
    # -> {"status":"ok"}
    ```
 
-Update this skill once a DB migration step, seed-data loading, or a local mail-catcher
-(for the assignment-notification emails) become part of the run flow — those will need
-to start alongside the API for reviewers to exercise the full scenario.
+The database is seeded automatically on first boot. `rm app.db` to start clean.
+
+To skip email entirely, set `EMAIL_BACKEND=noop` in `.env`.
