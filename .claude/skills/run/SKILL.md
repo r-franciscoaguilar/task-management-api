@@ -5,7 +5,7 @@ description: Start the Task Management API locally so it can be exercised manual
 
 # Run
 
-1. Ensure a virtualenv exists (Python 3.11+; this project was set up against 3.13) and
+1. Ensure a virtualenv exists (Python 3.11+, developed on 3.13) and
    dependencies are installed:
    ```bash
    python3.13 -m venv .venv   # only if .venv doesn't exist yet

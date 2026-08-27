@@ -7,6 +7,8 @@ hook was actually told about it.
 Built for the Software Engineer III take-home assessment. **Backend only** —
 there is no frontend, and other systems are expected to integrate with this API.
 
+[![tests](https://github.com/r-franciscoaguilar/task-management-api/actions/workflows/tests.yml/badge.svg)](https://github.com/r-franciscoaguilar/task-management-api/actions/workflows/tests.yml)
+
 > **Complete.** The full workflow is implemented and tested, including real SMTP
 > delivery of assignment emails, verified against an external provider.
 
@@ -14,7 +16,8 @@ there is no frontend, and other systems are expected to integrate with this API.
 
 ## Quick start
 
-Requires **Python 3.11+** (developed against 3.13).
+Requires **Python 3.11+**. Developed on 3.13; CI runs the suite on both 3.11
+and 3.13, so the declared floor is tested rather than assumed.
 
 ```bash
 python3 -m venv .venv
@@ -648,6 +651,8 @@ app/
   services/
     tasks.py                 lifecycle and visibility rules
     notifications.py         sender protocol, SMTP sender, message building
+.github/workflows/
+  tests.yml                  CI: pytest on 3.11 and 3.13
 tests/
   conftest.py                in-memory DB and fixtures shared by all tests
   test_auth_and_errors.py    identity, role guards, error envelope
@@ -685,6 +690,9 @@ tests/
 ```bash
 pytest -q
 ```
+
+GitHub Actions runs the same suite on every push, against Python 3.11 and 3.13
+(`.github/workflows/tests.yml`).
 
 Each test runs against a fresh in-memory SQLite database. `StaticPool` is
 required: every connection to `:memory:` otherwise gets its own empty database,
@@ -966,8 +974,8 @@ Ranked by what would hurt first:
    just a technical one.
 7. **A PII review of logs and error messages.** Assignment failures currently
    log an email address.
-8. **CI** running the test suite, plus a linter and type checker in the pipeline
-   rather than only locally.
+8. **A linter and type checker in the pipeline.** CI already runs the test suite
+   on every push; `ruff` and `mypy` belong beside it rather than only locally.
 
 ### What changed during the build
 
