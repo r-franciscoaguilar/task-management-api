@@ -697,13 +697,271 @@ oversights.
 
 ## Reflection
 
-_To be completed once the system is finished — see the assessment's required
-prompts. Notes are being captured in the design sections above as decisions are
-made, so these answers reflect the reasoning at the time rather than
-reconstruction afterwards._
+### How did you interpret the scenario? What assumptions did you make?
+
+I read the brief as describing a **system of record for accountability**, not a
+to-do list. Three phrases drove most of the design: work items must show "who
+created them, who is responsible for them, and where each item stands"; the
+assignee "must receive a real email"; and work should "not bounce backward
+without a good reason". Those map to a task with an owner, an auditable
+notification, and a state machine — and the rest followed from taking each
+literally.
+
+The assumptions I had to make, and how I resolved them:
+
+| Ambiguity | Resolution | Why |
+|---|---|---|
+| Who may create a task? | Either role | The brief frames creation role-agnostically ("someone identifies something that needs to be done"); only *assignment* is described as a management power |
+| Do managers own their own tasks? | No — managers are peers, any manager can see and assign anything | "Managers need to see everything" reads as shared oversight |
+| What does a worker's "own queue" contain? | Tasks assigned to them **plus tasks they filed** | A worker who reports a problem shouldn't lose sight of it before it's routed |
+| What does "forward" mean? | `UNASSIGNED → ASSIGNED → IN_PROGRESS → DONE`, with one audited backward edge | The qualifier "without a good reason" implies backward movement *with* a reason is acceptable |
+| Is `DONE` reopenable? | No, terminal | Nothing in the brief suggests reopening; a completed task that changes is really new work |
+| When are notifications sent? | On assignment only | That is the one moment the brief names. Notifying on every transition would be inventing a requirement |
+| What identifies the caller? | An `X-User-Id` header | Authentication is explicitly out of scope; something had to stand in for it |
+
+I also decided what **not** to infer. There are no due dates, priorities,
+comments, attachments, teams, or task editing. Each would have been plausible,
+none was asked for, and the brief says a focused implementation of the core
+workflow is worth more than breadth. The features I did add beyond a literal
+reading — the release transition and the two audit logs — exist because a
+specific sentence in the brief demanded them.
+
+### What were the most important design decisions in your solution, and why?
+
+**Two append-only event logs instead of mutable status fields.**
+`assignment_events` records who was made responsible and whether they were
+told; `status_change_events` records how the work moved and why it ever moved
+backward. They track genuinely orthogonal axes — reassigning changes ownership
+without changing status, and starting changes status without changing ownership
+— so neither is a subset of the other. The task row is a current-state
+projection over both. This is what makes traceability a queryable fact rather
+than a claim. The accepted cost is that assigning writes to both tables, and
+that reconstructing a single unified timeline means reading both.
+
+**All business rules live in a service layer.** `app/services/tasks.py` decides
+what is allowed; routers only translate HTTP. Two payoffs: the rules are
+testable without an HTTP layer, and a rule enforced in one place cannot be
+forgotten by a second endpoint touching the same data. Services raise typed
+errors and never build responses.
+
+**One error envelope, with machine-readable codes.** Every failure — domain
+rejection, malformed body, unmatched route — returns
+`{"error", "message", ...context}`. FastAPI's own validation errors are
+reshaped into it, so a client never parses two formats. Refusals are
+deliberately *distinguishable*: assigning to a manager is `invalid_assignee`
+(422) while assigning to a nonexistent user is `not_found` (404), because a
+client should be able to explain the difference to a person.
+
+**Visibility is checked before ownership, and the two fail differently.** A task
+the caller may not see returns 404 with wording identical to a task that never
+existed — a 403 would confirm existence and leak information. But a task they
+*can* see and merely don't own returns 403, because denying its existence would
+be nonsense. I read "the wrong person cannot" as cannot *observe*, not only
+cannot modify.
+
+**The audit record is committed before the email is attempted, and a failed
+send never rolls back the assignment.** If the process dies mid-send, a
+`PENDING` record survives — an assignment whose notification is unaccounted
+for, which is visible and retryable. And who is responsible for work must not
+depend on a mail server being reachable. Detail in
+[Assignments and notifications](#assignments-and-notifications).
+
+**Transitions are POST, and deliberately not idempotent.** `/start` names no
+fetchable resource, so PUT and PATCH both misfit; POST is the method for
+commands. Non-idempotency is a real choice with a real cost, argued in
+[POST for state transitions](#post-for-state-transitions).
+
+### How did you handle assignments and notifications?
+
+`POST /tasks/{id}/assign` is managers-only and refuses in five distinguishable
+ways (worker caller, unknown user, assignee is a manager, already that person's,
+work already under way). Each successful call appends an `AssignmentEvent`, so
+reassignment produces history rather than overwriting it.
+
+The ordering inside the service is the design:
+
+1. Authorize, validate the assignee, check the lifecycle permits it.
+2. Update the task; insert an `AssignmentEvent` with `notification_status = PENDING`.
+3. **Commit** — the audit record now exists, before any delivery is attempted.
+4. Attempt delivery; record `SENT` with a timestamp or `FAILED` with the error
+   text. Commit again.
+
+Delivery failure is recorded, not swallowed: it appears on the task's
+`latest_assignment`, in `GET /tasks/{id}/assignments`, and in the logs. Seeded
+task 7 ships in exactly that state so a reviewer can see it without breaking
+anything. Every exception is caught during the send, not only the declared one —
+by that point the assignment is committed, so letting an unexpected error escape
+would return 500 for a request that actually succeeded.
+
+Sending is behind a `NotificationSender` protocol resolved as a **FastAPI
+dependency**. That is what makes the failure path provable: tests inject a
+sender that raises on demand and assert the assignment still stands with the
+failure recorded. You cannot test "email is broken" against a real sender.
+
+The honest limitation: delivery is **synchronous and single-attempt**, so a slow
+mail server slows the request and a transient failure needs manual
+intervention. The `PENDING` state exists precisely so a retry mechanism can be
+added without schema change.
+
+### How would you evolve this if the team or workload grew?
+
+**Immediately, on volume:** move to Postgres for concurrent writes and real
+indexing — SQLite serialises writers, which is fine for a demo and wrong for a
+team. Switch the task list to cursor pagination; offset paging drifts when rows
+are inserted mid-browse and degrades as the offset grows. The visibility filter
+(`creator_id` or `assignee_id`) becomes the hot query, and both columns are
+already indexed for it.
+
+**On the notification path:** move delivery to an outbox plus a background
+worker with retry and backoff, so assignment latency stops depending on SMTP.
+At team scale, people also stop wanting one email per assignment — that becomes
+digests and per-user preferences, which is a new entity rather than a tweak.
+
+**On the model, as the team grows:** managers are currently peers who all see
+everything. Past a certain size that becomes noise, and tasks would need to
+belong to a team or area with visibility scoped accordingly — the single place
+that would change is `_visibility_conditions`, which is why that logic is one
+function.
+
+**On the API:** a read-side view that merges both event logs into one timeline,
+since the current design requires two calls to tell the full story. Then due
+dates, priority, and sorting on them — which is what "supervisors have no single
+place to see what is in flight" eventually demands once there is more in flight
+than fits on a screen.
+
+The [Evolution](#evolution) section lists these with the reasoning attached.
+
+### What trade-offs did you make given the timebox?
+
+Every item here is a decision I would defend in context, not a corner I hoped
+nobody would notice.
+
+- **SQLite over Postgres.** Zero infrastructure means a reviewer runs one
+  command. Costs concurrent writes and real index behaviour.
+- **`create_all()` over Alembic.** Cannot evolve a schema holding data, but
+  there is no deployment in scope and migration tooling would have been setup
+  cost with no payoff.
+- **Header-based identity.** Anyone who can reach the service can claim to be
+  anyone. Acceptable only because authentication is explicitly out of scope, and
+  isolated to one dependency function so replacing it is a contained change.
+- **Offset pagination.** Simpler, and it answers "how many are there" cheaply,
+  which cursors don't.
+- **Synchronous email.** No queue infrastructure to run locally; the cost is
+  request latency coupled to SMTP.
+- **The seed writes rows directly instead of calling the services.** Going
+  through the services would guarantee consistency, but assigning sends email,
+  so seeding that way would fire notifications at fake addresses on every boot.
+  I mirrored the service behaviour and wrote invariant tests to catch drift —
+  and they immediately caught a real bug.
+- **No task editing, cancellation, or deletion.** Not in the brief. A real
+  operations team needs all three.
+- **The user directory is readable by both roles.** Convenient for reviewers,
+  and it exposes email addresses more widely than a production system should.
+- **No rate limiting, metrics, or structured logging.** Operability here means
+  "a person can run and inspect it locally", which the brief asks for; it does
+  not yet mean observable in production.
+
+What I deliberately did **not** trade away: the authorization boundaries and the
+lifecycle rules. Those are the correctness requirements, so they are enforced
+server-side in one place and carry the majority of the 145 tests.
+
+### What would you add or change before production?
+
+Ranked by what would hurt first:
+
+1. **Real authentication.** Replace the trusted header with a verified token.
+   Nothing else about authorization changes — the role checks already run
+   server-side.
+2. **Asynchronous notification with retries.** An outbox and a worker, so a
+   `FAILED` send resolves itself instead of needing a human.
+3. **Migrations.** Alembic before the first deployment that holds real data.
+4. **Postgres**, with the transaction and index review that implies.
+5. **Idempotency keys.** Transitions are non-idempotent by design, which leaves
+   a client unable to distinguish "already applied" from "out of order" after a
+   timeout. An `Idempotency-Key` header with server-side dedup is the right fix
+   — not making transitions silent no-ops, which would discard the signal the
+   brief asked us to surface.
+6. **Observability.** Structured logs with a request id, metrics on assignment
+   and notification failure rates, and an alert when `FAILED` or `PENDING`
+   notifications accumulate — that number going up is a business problem, not
+   just a technical one.
+7. **A PII review of logs and error messages.** Assignment failures currently
+   log an email address.
+8. **CI** running the test suite, plus a linter and type checker in the pipeline
+   rather than only locally.
+
+### What changed during the build
+
+Worth recording, because none of it was in the first design:
+
+- **The state machine was originally strictly forward-only.** Re-reading
+  "without a good reason" made clear the qualifier was doing real work, and that
+  a strict reading left two holes: a blocked worker could only abandon a task in
+  `IN_PROGRESS` or falsely complete it, and since in-progress work cannot be
+  reassigned, anything picked up by the wrong person was stuck there forever.
+  The `release` transition with a mandatory reason closes both.
+- **Worker-supplied list filters were originally ignored.** In practice that
+  meant a worker filtering by someone else's id silently received their own
+  tasks — actively misleading. Applying filters *inside* the visible scope is
+  both less code and truthful: an empty page means "nothing you can see
+  matches".
+- **Transitions were originally `PATCH /tasks/{id}/start`.** That borrows
+  resource-modification semantics for what is really a command, and `/start`
+  names no resource to modify. POST is the honest verb.
 
 ---
 
 ## AI usage disclosure
 
-_To be completed._
+**Tools used.** Claude (Opus, via the Claude Code CLI) throughout, as a pair
+rather than a code generator: scaffolding, most of the implementation, the test
+suite, and drafting this README.
+
+**How the work was divided.** I directed the design and made the judgment
+calls; the model did most of the typing and pushed back with rationale when I
+asked for something questionable. The decisions I would call mine are the shape
+of the domain (what the entities are and what belongs in each), the choice of
+what to leave out, and two changes that came from challenging the first
+proposal:
+
+- I questioned `PATCH` on the transition endpoints, which led to working through
+  PUT/PATCH/POST semantics properly and switching to POST.
+- I pushed back that a strictly forward-only state machine felt wrong for real
+  work, which produced the `release` transition and the second event table.
+
+Both are documented above under [What changed during the
+build](#what-changed-during-the-build).
+
+**What I validated rather than assumed.** Every endpoint was exercised manually
+with curl against a running server, not just via tests — the two are different
+checks, and the first caught things the second missed. Three real bugs surfaced
+this way or through the tests:
+
+1. A freshly constructed `Task` has `status = None` until flushed, because
+   column defaults apply on INSERT rather than in `__init__`. The seed was
+   recording a status change *from nothing*. Caught by the seed invariant tests.
+2. Setting `task.assignee_id` left an already-loaded `assignee` relationship
+   stale, and because sessions use `expire_on_commit=False`, that stale `None`
+   survived the commit and was serialised — a freshly assigned task reported no
+   assignee. Fixed by assigning the relationship instead of the foreign key.
+3. Two of my own test assertions were wrong rather than the code: a `release`
+   also moves *to* `ASSIGNED`, so counting `ASSIGNED`-bound status changes did
+   not isolate reassignment; and an unassigned task filed by a manager is
+   invisible to a worker, so 404 is correct there rather than 403.
+
+I mention these because "the tests pass" is weak evidence on its own. The seed
+invariant tests exist precisely because the seed duplicates service logic, and
+they earned their place on the first run.
+
+**What I would do differently without AI.** It would have taken considerably
+longer, and I would have written less: fewer tests, a much shorter README, and
+probably no invariant tests over the demo data. I suspect I would also have
+shipped the strictly forward-only state machine without noticing how much work
+the phrase "without a good reason" was doing — reading the brief that closely is
+easier when drafting is cheap.
+
+Where I was most careful with generated output: anything security-relevant.
+The 404-versus-403 distinction, the scoped `total`, and the identical wording
+between "hidden" and "missing" responses are all places where plausible-looking
+code would have leaked information, so each has an explicit test asserting the
+boundary rather than the happy path.
