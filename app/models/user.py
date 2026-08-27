@@ -17,9 +17,8 @@ class UserRole(str, enum.Enum):
 class User(Base):
     """A person who already exists in the organization.
 
-    Authentication lives elsewhere (see the README): the API trusts an
-    X-User-Id header to identify the caller, and this row supplies the role
-    that authorization is based on.
+    Authentication lives elsewhere; this row supplies the role that
+    authorization is based on.
     """
 
     __tablename__ = "users"

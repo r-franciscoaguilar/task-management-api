@@ -1,8 +1,5 @@
-"""Importing every model here registers it on Base.metadata.
-
-Anything that calls create_all (app startup, test fixtures) only needs to
-import this package for the full schema to exist.
-"""
+"""Importing every model here registers it on Base.metadata, so callers of
+create_all only need to import this package."""
 
 from app.models.assignment_event import AssignmentEvent, NotificationStatus
 from app.models.status_change_event import StatusChangeEvent

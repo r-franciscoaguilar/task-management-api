@@ -1,17 +1,10 @@
-"""One error envelope for every failure the API can produce.
-
-The business asked that invalid actions "fail in a way a client application
-could explain to a user". That means two things: a machine-readable code the
-client can branch on, and a human-readable message it can surface. Every
-response below has the same shape:
+"""One error envelope for every failure:
 
     {"error": "<machine_code>", "message": "<human text>", ...context}
 
-Domain code raises an AppError subclass and never builds an HTTP response
-itself, so services stay free of web-framework concerns. The handlers
-registered here also normalize FastAPI's own validation errors and any stray
-HTTPException into the same envelope, so a client never has to parse two
-different error formats.
+Domain code raises AppError and never builds a response, so services stay free
+of HTTP concerns. FastAPI's own validation errors and stray HTTPExceptions are
+normalized into the same shape, so clients parse one format.
 """
 
 from typing import Any
@@ -24,12 +17,10 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 
 class AppError(Exception):
-    """Base for every expected, client-explainable failure.
+    """Base for expected, client-explainable failures.
 
-    Subclasses pin the HTTP status and the default machine code. Extra keyword
-    arguments become additional top-level fields in the response body, which is
-    how a caller learns *why* something was rejected (for example the
-    `current_status` that made a transition invalid).
+    Subclasses pin the status and machine code. Extra keyword arguments become
+    top-level response fields explaining why -- e.g. `current_status`.
     """
 
     status_code: int = 500
@@ -84,11 +75,10 @@ class ValidationError(AppError):
 
 
 class InvalidStateTransitionError(ConflictError):
-    """A lifecycle move that the state machine does not allow.
+    """A lifecycle move the state machine forbids.
 
-    Always carries `current_status` so a client can reconcile its own view --
-    which is also what makes a retried transition recoverable despite these
-    operations being deliberately non-idempotent.
+    Always carries `current_status`, which is how a client that retried after a
+    timeout reconciles its view despite transitions being non-idempotent.
     """
 
     error_code = "invalid_state_transition"
@@ -97,8 +87,7 @@ class InvalidStateTransitionError(ConflictError):
         super().__init__(message, current_status=current_status, **context)
 
 
-# Stray HTTPExceptions (mostly framework-generated, e.g. an unmatched route)
-# get a sensible code so the envelope stays uniform.
+# Framework-generated HTTPExceptions (e.g. unmatched route) need a code too.
 _HTTP_ERROR_CODES = {
     401: "unauthenticated",
     403: "forbidden",
@@ -118,8 +107,7 @@ def register_exception_handlers(app: FastAPI) -> None:
     async def _handle_request_validation(
         request: Request, exc: RequestValidationError
     ) -> JSONResponse:
-        # FastAPI's default body is {"detail": [...]}. Reshaped here so clients
-        # see the same envelope for a malformed body as for a domain rejection.
+        # FastAPI's default is {"detail": [...]}; reshaped to match the rest.
         return JSONResponse(
             status_code=422,
             content={

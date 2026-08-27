@@ -64,8 +64,8 @@ def list_tasks(
 ) -> Page[TaskOut]:
     """A page of tasks, newest first.
 
-    Managers see the whole team's workload; workers see their own queue plus
-    anything they filed. Filters apply within that scope, never around it.
+    Managers see the team's workload; workers see their own queue plus anything
+    they filed. Filters apply within that scope, never around it.
     """
     items, total = task_service.list_tasks(
         db,
@@ -88,9 +88,8 @@ def list_tasks(
 def get_task(task_id: int, db: DbSession, caller: CurrentUser) -> TaskDetailOut:
     """Fetch a task the caller is entitled to see, otherwise 404.
 
-    Includes the most recent assignment so that whether the assignee was
-    actually notified is visible where a human looks, not only via the history
-    endpoint.
+    Includes the latest assignment, so notification status is visible without a
+    second call. Lists omit it to avoid loading history per row.
     """
     task = task_service.get_task(db, caller=caller, task_id=task_id)
     detail = TaskDetailOut.model_validate(task)
@@ -115,8 +114,7 @@ def assign_task(
 ) -> TaskDetailOut:
     """Make a worker responsible for a task, and email them.
 
-    Managers only. Permitted while the task is UNASSIGNED or ASSIGNED; work
-    already in progress must be released by its assignee first.
+    Managers only, and only while UNASSIGNED or ASSIGNED.
     """
     task = task_service.assign_task(
         db,
@@ -136,12 +134,8 @@ def assign_task(
     "/{task_id}/start", response_model=TaskOut, summary="Start assigned work"
 )
 def start_task(task_id: int, db: DbSession, caller: WorkerUser) -> Task:
-    """Move a task to IN_PROGRESS.
-
-    Workers only, and only the assignee: the brief says managers "should not be
-    doing someone else's work on their behalf", so progressing a task is not a
-    manager capability at all.
-    """
+    """Move a task to IN_PROGRESS. The assignee only -- progressing work is not
+    a manager capability."""
     return task_service.start_task(db, caller=caller, task_id=task_id)
 
 
@@ -163,9 +157,7 @@ def release_task(
 ) -> Task:
     """Return in-progress work to ASSIGNED, recording why.
 
-    The only backward transition in the system. The reason is mandatory and is
-    kept in the task's history, which is what makes "not backward without a good
-    reason" an enforced rule rather than an expectation.
+    The only backward transition. The reason is mandatory and kept in history.
     """
     return task_service.release_task(
         db, caller=caller, task_id=task_id, reason=payload.reason
@@ -192,9 +184,6 @@ def list_history(
 def list_assignments(
     task_id: int, db: DbSession, caller: CurrentUser
 ) -> list[AssignmentEvent]:
-    """Every assignment this task has had, newest first.
-
-    Includes whether each notification was delivered, which is what makes the
-    traceability requirement checkable rather than assumed.
-    """
+    """Every assignment this task has had, newest first, including whether each
+    notification was delivered."""
     return task_service.list_assignments(db, caller=caller, task_id=task_id)

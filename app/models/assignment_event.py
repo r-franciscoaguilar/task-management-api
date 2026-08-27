@@ -23,11 +23,9 @@ class NotificationStatus(str, enum.Enum):
 class AssignmentEvent(Base):
     """An append-only record of one assignment and its notification attempt.
 
-    This is what makes the business's traceability requirement concrete: every
-    assignment writes a row before any email is attempted, and the outcome of
-    that attempt is recorded on it. 
-    Then, a failed notification is visible rather than silent,
-    and reassignment produces a history rather than overwriting what came before.
+    The row is written before any email is attempted, and the outcome recorded
+    on it, so a failed notification is visible rather than silent. Reassignment
+    appends rather than overwriting.
     """
 
     __tablename__ = "assignment_events"

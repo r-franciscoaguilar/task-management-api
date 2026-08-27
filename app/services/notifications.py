@@ -1,14 +1,8 @@
-"""Sending notifications, behind a boundary.
+"""Email delivery, behind a one-method protocol.
 
-The brief is emphatic that an assignee "must receive a real email. Not a mock,
-not a log line", so the default sender opens an SMTP connection and delivers.
-NoopEmailSender exists only for deliberately switching email off; it is not the
-default, and nothing in the normal path pretends to send.
-
-Delivery sits behind a one-method protocol resolved as a FastAPI dependency.
-That is what lets tests inject a sender that fails on demand and assert the
-system stays correct when email breaks -- the case that actually needs proving,
-and one that cannot be exercised against a real mail server.
+The protocol is resolved as a FastAPI dependency so tests can inject a sender
+that fails on demand -- the failure path cannot be exercised against a working
+mail server.
 """
 
 import smtplib
@@ -39,12 +33,10 @@ class NotificationSender(Protocol):
 
 
 class NoopEmailSender:
-    """Discards messages without sending them.
+    """Discards messages. Only for EMAIL_BACKEND=noop.
 
-    Only selected by EMAIL_BACKEND=noop, for when email must be switched off on
-    purpose -- a demo without a mail server, or a load test. It reports success,
-    so it must never be the default: that would make every notification record
-    read SENT while nothing was delivered.
+    Never the default: reporting success without delivering would make every
+    notification record read SENT while nothing was sent.
     """
 
     def send(self, message: EmailMessage) -> None:
@@ -52,12 +44,8 @@ class NoopEmailSender:
 
 
 class SmtpEmailSender:
-    """Delivers over SMTP using the standard library.
-
-    A connection is opened per message. That is wasteful at volume, and the
-    right fix is not connection pooling but moving delivery off the request
-    path entirely -- see the README's evolution notes.
-    """
+    """Delivers over SMTP. One connection per message; see README for why that
+    is acceptable here and what would replace it."""
 
     def __init__(
         self,
@@ -89,11 +77,9 @@ class SmtpEmailSender:
     def send(self, message: EmailMessage) -> None:
         """Deliver one message, or raise NotificationSendError.
 
-        Every failure mode is translated into NotificationSendError so callers
-        depend on this module's contract rather than on smtplib's exception
-        hierarchy. The message text names the host and port, because
-        "connection refused" on its own tells an operator nothing about which
-        server was unreachable.
+        Failures are translated so callers depend on this module rather than on
+        smtplib's exception hierarchy. The text names host and port: "connection
+        refused" alone does not say which server.
         """
         try:
             with smtplib.SMTP(
@@ -116,8 +102,7 @@ def build_assignment_email(
 ) -> EmailMessage:
     """Compose the message an assignee receives.
 
-    Content lives here rather than in the task service so that what gets sent
-    can be tested without touching the database or the lifecycle rules.
+    Kept out of the task service so content is testable without a database.
     """
     lines = [
         f"Hello {assignee.name},",
@@ -140,15 +125,11 @@ def build_assignment_email(
 
 
 class RedirectingSender:
-    """Wraps another sender and diverts every message to one address.
+    """Diverts every message to one address, keeping the intended recipient in
+    the subject.
 
-    Composes with any backend rather than being built into the SMTP sender, so
-    the redirect rule is one small testable thing and does not complicate
-    delivery.
-
-    The original recipient is preserved in the subject line. Without that, a
-    redirected inbox is a pile of messages with no way to tell who each was
-    meant for -- which defeats the point of testing with it.
+    A wrapper rather than a flag inside SmtpEmailSender, so it composes with
+    either backend.
     """
 
     def __init__(self, inner: NotificationSender, address: str) -> None:
@@ -166,11 +147,11 @@ class RedirectingSender:
 
 
 def build_sender(settings: Settings) -> NotificationSender:
-    """Construct the sender described by the given settings.
+    """Construct the sender for these settings.
 
-    Kept separate from the dependency below so it can be tested directly --
-    get_notification_sender takes no arguments on purpose, since FastAPI would
-    otherwise try to bind any parameter to the request.
+    Separate from the dependency below so it is directly testable:
+    get_notification_sender must take no arguments, or FastAPI would try to
+    bind them to the request.
     """
     sender: NotificationSender
     if settings.email_backend == "noop":
@@ -193,9 +174,5 @@ def build_sender(settings: Settings) -> NotificationSender:
 
 
 def get_notification_sender() -> NotificationSender:
-    """The sender for this deployment, as a FastAPI dependency.
-
-    Being a dependency is what allows a test to substitute a recording or
-    failing sender without patching module internals.
-    """
+    """The sender for this deployment, as an overridable dependency."""
     return build_sender(get_settings())

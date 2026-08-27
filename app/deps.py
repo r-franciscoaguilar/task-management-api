@@ -1,11 +1,8 @@
 """Request-scoped dependencies: who is calling, and may they do this.
 
-Authentication is out of scope for this exercise -- accounts live in another
-system -- so the API trusts an `X-User-Id` header to name the caller and looks
-the role up from the database. This is a deliberate stand-in for a real
-identity layer, and the trade-off is spelled out in the README: anyone who can
-reach the service can claim to be anyone. Authorization, by contrast, is real:
-every rule below is enforced server-side and covered by tests.
+Authentication is out of scope, so the API trusts an `X-User-Id` header and
+looks the role up from the database. Anyone reaching the service can therefore
+claim to be anyone -- see the README. Authorization is real and tested.
 """
 
 from dataclasses import dataclass
@@ -31,11 +28,9 @@ def get_current_user(
 ) -> User:
     """Resolve the caller from the identity header.
 
-    The header is typed as a string rather than an int on purpose. If it were
-    an int, FastAPI would reject a non-numeric value with its own 422 before
-    this function ran, so `X-User-Id: bogus` and `X-User-Id: 999999` would fail
-    in two different ways. Both are the same thing from the caller's point of
-    view -- an unusable credential -- so both return 401 here.
+    Typed as a string, not an int: an int annotation would make FastAPI reject
+    `bogus` with its own 422, so a malformed credential and an unknown one
+    would fail differently. Both are unusable credentials, so both are 401.
     """
     if x_user_id is None or not x_user_id.strip():
         raise UnauthenticatedError(
@@ -76,9 +71,8 @@ def require_manager(user: CurrentUser) -> User:
 def require_worker(user: CurrentUser) -> User:
     """Guard for actions that belong to people who do the work.
 
-    Managers are excluded rather than merely unhelped here: the brief says they
-    "should not be doing someone else's work on their behalf", so progressing a
-    task is not a manager capability at all.
+    Managers are excluded outright: progressing a task is not a manager
+    capability, per the brief.
     """
     if user.role is not UserRole.WORKER:
         raise ForbiddenError(
@@ -108,11 +102,8 @@ def page_params(
     ] = DEFAULT_PAGE_SIZE,
     offset: Annotated[int, Query(ge=0, description="Rows to skip.")] = 0,
 ) -> PageParams:
-    """Shared paging bounds.
-
-    `le=MAX_PAGE_SIZE` matters: without a ceiling, a caller could request
-    limit=1000000 and turn a list endpoint into a denial-of-service lever.
-    """
+    """Shared paging bounds. The `le` ceiling matters: an unbounded limit is a
+    denial-of-service lever."""
     return PageParams(limit=limit, offset=offset)
 
 

@@ -1,9 +1,8 @@
 """Shared test infrastructure.
 
-Each test gets a fresh in-memory SQLite database. StaticPool is what makes an
-in-memory DB usable here: by default every new connection to ":memory:" gets
-its own empty database, so the pool must hand out one single connection to the
-app, the fixtures, and the assertions alike.
+Each test gets a fresh in-memory SQLite database. StaticPool is required: every
+new connection to ":memory:" otherwise gets its own empty database, so the pool
+must hand the same one to the app, the fixtures, and the assertions.
 """
 
 from collections.abc import Callable, Generator, Iterator
@@ -60,11 +59,8 @@ def override_get_db(
 
 @pytest.fixture()
 def users(db: Session) -> dict[str, User]:
-    """A minimal cast: one of each role, plus a second worker.
-
-    Deliberately smaller and independent of app/seed.py -- tests should not
-    break when the demo seed data changes.
-    """
+    """One of each role, plus a second worker. Independent of app/seed.py so
+    tests do not break when demo data changes."""
     people = {
         "manager": User(name="Alice", email="alice@example.com", role=UserRole.MANAGER),
         "worker": User(name="Carol", email="carol@example.com", role=UserRole.WORKER),
@@ -81,12 +77,8 @@ def auth(user: User) -> dict[str, str]:
 
 
 class RecordingSender:
-    """A notification sender that remembers what it was asked to send.
-
-    Set `fail_with` to make delivery raise, which is how the tests prove the
-    system stays correct when email is broken -- the case that matters most and
-    is impossible to exercise with the real sender.
-    """
+    """Remembers what it was asked to send. Set `fail_with` to make delivery
+    raise, which is how the failure path gets tested at all."""
 
     def __init__(self) -> None:
         self.sent: list[EmailMessage] = []
@@ -113,11 +105,9 @@ def client(
 ) -> Iterator[TestClient]:
     """The real application, wired to the test database.
 
-    TestClient is used *without* its context manager on purpose. Entering the
-    context would run the app's lifespan, which calls create_all and
-    seed_if_empty against the real engine -- writing to the developer's app.db
-    from a test run. Tables here are created by the `engine` fixture instead,
-    and tests arrange their own data.
+    TestClient is used *without* its context manager on purpose: entering it
+    would run the lifespan, which calls create_all and seed_if_empty against the
+    real engine -- writing to the developer's app.db during a test run.
     """
     from app.db import get_db
     from app.main import app
@@ -133,12 +123,8 @@ def client(
 
 @pytest.fixture()
 def make_task(db: Session) -> Callable[..., Task]:
-    """Build a task directly in the database.
-
-    Tests arrange state through this rather than through the API so that a
-    failure in, say, the assign endpoint cannot make unrelated tests fail to
-    set up.
-    """
+    """Build a task directly in the database, so a bug in one endpoint cannot
+    break unrelated tests' setup."""
 
     def _make(
         *,

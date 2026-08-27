@@ -16,18 +16,11 @@ if TYPE_CHECKING:
 
 
 class TaskStatus(str, enum.Enum):
-    """The lifecycle of a work item.
+    """UNASSIGNED -> ASSIGNED -> IN_PROGRESS -> DONE; DONE is terminal.
 
-    The forward path is UNASSIGNED -> ASSIGNED -> IN_PROGRESS -> DONE, and
-    DONE is terminal.
-
-    There is exactly one backward edge: an assignee may release work from
-    IN_PROGRESS back to ASSIGNED, and only with a recorded reason. That
-    implements the business rule "work should not move backward without a
-    good reason" as an audited action rather than an unenforced expectation.
-    Every other backward move is impossible because no operation exists for
-    it -- the invariant is enforced by absence, not by a guard that could be
-    bypassed.
+    The one backward edge is release (IN_PROGRESS -> ASSIGNED), which requires
+    a reason. Every other backward move is impossible because no operation
+    exists for it, rather than being blocked by a guard.
     """
 
     UNASSIGNED = "UNASSIGNED"
@@ -37,11 +30,10 @@ class TaskStatus(str, enum.Enum):
 
 
 class Task(Base):
-    """A unit of work, and the current-state projection of its history.
+    """A unit of work, and the current-state projection of its event history.
 
-    `status` and `assignee_id` answer "where does this stand and whose is it
-    right now"; the append-only AssignmentEvent rows answer "how did it get
-    here, and was the assignee actually told".
+    `status` and `assignee_id` say where it stands now; the append-only event
+    tables say how it got there and whether the assignee was told.
     """
 
     __tablename__ = "tasks"

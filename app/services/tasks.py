@@ -1,11 +1,8 @@
 """Task business rules.
 
-Everything that decides *what is allowed* lives here rather than in the
-routers, for two reasons: the rules are testable without an HTTP layer, and a
-rule enforced in one place cannot be forgotten by a second endpoint that
-touches the same data.
-
-These functions raise AppError subclasses and never build HTTP responses.
+Everything deciding what is allowed lives here, not in the routers: the rules
+are testable without HTTP, and a rule in one place cannot be forgotten by a
+second endpoint. These functions raise AppError and never build responses.
 """
 
 import logging
@@ -41,13 +38,10 @@ logger = logging.getLogger(__name__)
 def create_task(
     session: Session, *, creator: User, title: str, description: str | None
 ) -> Task:
-    """File a new task.
+    """File a new task. Open to both roles.
 
-    Open to both roles. The brief describes creation role-agnostically ("work
-    starts when someone identifies something that needs to be done") and only
-    assignment as a management power. A new task always starts UNASSIGNED --
-    the caller cannot hand it to someone in the same breath, because assigning
-    is a separate, notified, audited action.
+    Always starts UNASSIGNED: the caller cannot assign in the same breath,
+    because assigning is separately notified and audited.
     """
     task = Task(title=title, description=description, creator_id=creator.id)
     session.add(task)
@@ -58,10 +52,9 @@ def create_task(
 def _visibility_conditions(caller: User) -> list[ColumnElement[bool]]:
     """Rows this caller is allowed to know exist.
 
-    Managers see everything -- the brief says they need visibility across the
-    team. Workers see what is theirs, which means work assigned to them *or*
-    work they filed themselves: a worker who reports a problem should not lose
-    sight of it just because it has not been routed to them yet.
+    Managers see everything. Workers see work assigned to them *or* filed by
+    them -- reporting a problem should not mean losing sight of it before it is
+    routed.
     """
     if caller.role is UserRole.MANAGER:
         return []
@@ -86,10 +79,8 @@ def list_tasks(
 ) -> tuple[list[Task], int]:
     """A page of visible tasks, newest first, plus the total that matched.
 
-    Filters are applied *inside* the caller's visible scope rather than being
-    ignored for workers. So a worker filtering by someone else's assignee_id
-    gets an empty page -- a truthful "nothing you can see matches" -- instead of
-    silently receiving their own tasks back, which would be actively misleading.
+    Filters apply *inside* the visible scope, so a worker filtering by someone
+    else's assignee_id gets an empty page rather than their own tasks back.
     """
     conditions = _visibility_conditions(caller)
     if status is not None:
@@ -121,10 +112,8 @@ def list_tasks(
 def get_task(session: Session, *, caller: User, task_id: int) -> Task:
     """Fetch one task, or raise as though it does not exist.
 
-    A task the caller may not see returns exactly the same 404 as a task that
-    genuinely is not there -- same status, same message. A 403 would confirm the
-    task exists, which is information the caller has no right to. "The wrong
-    person cannot" is read as cannot *observe*, not merely cannot modify.
+    A task the caller may not see returns the same 404, wording included, as
+    one that is genuinely absent. A 403 would confirm it exists.
     """
     task = session.get(Task, task_id)
     if task is None or not may_view(caller, task):
@@ -137,8 +126,7 @@ def list_assignments(
 ) -> list[AssignmentEvent]:
     """The assignment history of one task, newest first.
 
-    Goes through get_task so the same visibility rule applies: a caller who may
-    not see the task may not see who it has been given to either.
+    Via get_task, so whoever cannot see the task cannot see its assignments.
     """
     task = get_task(session, caller=caller, task_id=task_id)
     return list(task.assignment_events)
@@ -154,10 +142,8 @@ def assign_task(
 ) -> Task:
     """Put a worker on the hook for a task, and tell them.
 
-    Only reachable by a manager (enforced at the route). Allowed while a task is
-    UNASSIGNED or ASSIGNED -- a manager may redirect work that has not been
-    picked up yet, but not work already in progress; for that the assignee must
-    release it first, which records why.
+    Managers only (enforced at the route), and only while UNASSIGNED or
+    ASSIGNED: work already under way must be released by its assignee first.
     """
     task = get_task(session, caller=caller, task_id=task_id)
 
@@ -256,20 +242,17 @@ def _notify_assignee(
 ) -> None:
     """Attempt delivery and record the outcome on the assignment record.
 
-    Delivery failure never rolls back the assignment: who is responsible for
-    work must not depend on an email server being reachable. But the failure is
-    not silent either -- it is stored on the event, served by the API, and
-    logged.
+    Failure never rolls back the assignment -- responsibility must not depend on
+    a reachable mail server -- but is not silent either: it is stored, served,
+    and logged.
 
-    Every exception is caught, not just NotificationSendError. The assignment is
-    already committed at this point, so letting an unexpected error escape would
-    return 500 to a client whose request actually succeeded, and leave the
-    notification recorded as PENDING forever. Recording FAILED with the message
-    is both more honest and more useful.
+    Every exception is caught, not only NotificationSendError. The assignment is
+    already committed, so letting one escape would return 500 for a request that
+    succeeded and leave the notification PENDING forever.
     """
     try:
         sender.send(build_assignment_email(task=task, assignee=assignee, assigned_by=by))
-    except Exception as error:  # noqa: BLE001 -- see docstring
+    except Exception as error:  # broad by design -- see docstring
         logger.warning(
             "Assignment notification failed for task %s to %s: %s",
             task.id,
@@ -296,12 +279,11 @@ def list_status_history(
 
 
 def _load_task_to_act_on(session: Session, *, caller: User, task_id: int) -> Task:
-    """Fetch a task the caller is allowed to *change*, not merely to read.
+    """Fetch a task the caller may *change*, not merely read.
 
-    Two tiers, and the distinction is intentional. Visibility comes first, so a
-    task the caller cannot see is a 404 -- they must not learn it exists. Only
-    then does being the assignee matter, and failing that is a 403: the caller
-    can see the task, so denying knowledge of it would be nonsense.
+    Visibility first: a task they cannot see is 404, so existence is not leaked.
+    Only then does being the assignee matter, and failing that is 403 -- they can
+    already see the task, so denying its existence would be nonsense.
     """
     task = get_task(session, caller=caller, task_id=task_id)
     if task.assignee_id != caller.id:
@@ -322,8 +304,7 @@ def _record_transition(
 ) -> Task:
     """Move a task and write the matching history row.
 
-    Single funnel for every lifecycle change, so a transition cannot be made
-    without being recorded.
+    Single funnel, so a transition cannot happen without being recorded.
     """
     now = utcnow()
 
@@ -378,15 +359,12 @@ def release_task(
 ) -> Task:
     """Hand work back because it cannot be continued.
 
-    The one backward transition in the system. The brief asks that work not move
-    backward "without a good reason", so the reason is mandatory and is stored
-    on the history row -- turning the rule into an auditable record instead of an
-    unenforced expectation.
+    The one backward transition, and the reason is mandatory: that is what makes
+    "not backward without a good reason" auditable rather than aspirational.
 
-    The task returns to ASSIGNED and stays with the same person. It is not
-    orphaned: someone remains nominally responsible until a manager redirects
-    it, which they now can, since reassignment is blocked only while work is
-    actually under way.
+    Returns to ASSIGNED with the same person, so the work is not orphaned -- and
+    a manager can now redirect it, since reassignment is blocked only while work
+    is under way.
     """
     task = _load_task_to_act_on(session, caller=caller, task_id=task_id)
 

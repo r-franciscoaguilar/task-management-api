@@ -20,7 +20,7 @@ class TaskCreate(BaseModel):
     @field_validator("title")
     @classmethod
     def _title_must_have_content(cls, value: str) -> str:
-        """Reject whitespace-only titles, which a length check alone allows."""
+        """A length check alone would allow a whitespace-only title."""
         stripped = value.strip()
         if not stripped:
             raise ValueError("title must not be blank")
@@ -38,10 +38,9 @@ class TaskCreate(BaseModel):
 class TaskOut(BaseModel):
     """A task as clients see it.
 
-    Creator and assignee are nested rather than exposed as bare ids: a client
-    rendering a queue needs names, and both relationships are already eager
-    loaded, so this costs no extra queries. Fields are listed explicitly so a
-    new model column can never leak into a response unnoticed.
+    Creator and assignee are nested rather than bare ids -- a queue needs names,
+    and both are already eager loaded. Fields are explicit so a new model column
+    cannot leak into a response.
     """
 
     model_config = ConfigDict(from_attributes=True)
@@ -61,12 +60,9 @@ class TaskOut(BaseModel):
 
 
 class TaskDetailOut(TaskOut):
-    """A single task, including its most recent assignment.
+    """A single task with its most recent assignment.
 
-    Only the detail endpoint carries this. Adding it to list responses would
-    mean loading assignment history for every row -- an N+1 query per page -- so
-    lists stay lean and the full trail is available at
-    GET /tasks/{id}/assignments.
+    Detail only: on lists this would load history per row -- an N+1 per page.
     """
 
     latest_assignment: AssignmentEventOut | None = None
@@ -79,8 +75,7 @@ class AssignRequest(BaseModel):
 class ReleaseRequest(BaseModel):
     """Handing work back requires saying why.
 
-    The reason is mandatory at the edge as well as in the service, so a client
-    gets a clear 422 rather than discovering the rule deeper in.
+    Checked here as well as in the service, so a client gets a clean 422.
     """
 
     reason: str = Field(

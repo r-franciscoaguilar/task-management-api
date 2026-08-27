@@ -1,20 +1,10 @@
 """Demo data so a reviewer can exercise the API immediately.
 
-Two things worth knowing about how this is built.
-
-**It writes event rows, not just tasks.** A seeded task sitting in IN_PROGRESS
-with no assignment or status history would contradict the invariants the API
-itself enforces -- it would represent someone being made responsible for work
-with no record of them being told, which is precisely what the traceability
-requirement forbids. So the seed walks each task through its lifecycle and
-writes the same rows the service layer writes.
-
-**It does not call the service layer to do that.** That would be the obvious
-way to guarantee consistency, but assigning a task sends a real email, so
-seeding through the services would fire notifications at fake addresses on
-every fresh boot. Instead the helpers below mirror the service behaviour, and
-tests/test_seed.py asserts the resulting data satisfies the invariants -- so
-drift is caught rather than assumed away.
+It writes event rows, not just tasks: a task in IN_PROGRESS with no history
+would contradict the invariants the API enforces. But it does not go through the
+service layer to do so, because assigning sends a real email and seeding that
+way would mail fake addresses on every boot. The helpers below mirror the
+service instead, and tests/test_seed.py catches drift.
 """
 
 from __future__ import annotations
@@ -56,15 +46,13 @@ def _assign(
     notification: NotificationStatus = NotificationStatus.SENT,
     error: str | None = None,
 ) -> None:
-    """Record an assignment exactly as the service layer will.
+    """Record an assignment as the service layer does.
 
-    Note the asymmetry that motivated two event tables: a *re*assignment writes
-    an AssignmentEvent but no StatusChangeEvent, because ownership moved while
-    status did not.
+    Note the asymmetry behind two event tables: a reassignment writes an
+    AssignmentEvent but no StatusChangeEvent -- ownership moved, status did not.
     """
-    # A freshly constructed Task has status=None until it is flushed: column
-    # defaults are applied on INSERT, not on __init__. Flushing first means we
-    # read the real current status rather than None.
+    # A fresh Task has status=None until flushed -- column defaults apply on
+    # INSERT, not __init__ -- so flush before reading the current status.
     session.flush()
     previous = task.status
 
@@ -127,10 +115,9 @@ def _move(
 
 
 def seed_if_empty(session: Session) -> bool:
-    """Populate demo data, unless any users already exist.
+    """Populate demo data unless any users exist. Returns True if it wrote.
 
-    Returns True if data was written. Guarding on emptiness keeps this safe to
-    run on every startup without duplicating or clobbering anything.
+    The emptiness guard makes this safe to run on every startup.
     """
     if session.scalar(select(func.count()).select_from(User)):
         return False

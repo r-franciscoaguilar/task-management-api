@@ -1,11 +1,8 @@
 """Read-only endpoints for discovering who exists.
 
-Nothing in the brief asks for a user directory; these exist for operability, so
-that a client integrating with the API -- or a reviewer running it locally --
-can find the ids to act as and the workers eligible to receive work. Both roles
-may read it: a manager needs it to choose an assignee, and it is a small,
-non-sensitive reference set. A production system would likely narrow this (see
-the README).
+Not asked for by the brief; they exist so a client or a reviewer can find the
+ids to act as and the workers eligible for work. Readable by both roles -- a
+manager needs it to choose an assignee. Production would likely narrow this.
 """
 
 from fastapi import APIRouter, Query
@@ -22,11 +19,7 @@ router = APIRouter(prefix="/users", tags=["users"])
 # id, should a /users/{user_id} route be added later.
 @router.get("/me", response_model=UserOut, summary="The caller's own record")
 def read_current_user(user: CurrentUser) -> User:
-    """Resolve whoever the X-User-Id header names.
-
-    Useful as a sanity check that a client is sending identity correctly, and
-    as the cheapest way to see one's own role.
-    """
+    """Resolve whoever the X-User-Id header names."""
     return user
 
 
@@ -40,9 +33,8 @@ def list_users(
 ) -> list[User]:
     """List everyone, optionally filtered by role.
 
-    Returned as a plain array rather than the paginated envelope used for
-    tasks. This is a small, bounded reference set, whereas the brief asks
-    specifically for a practical way to browse *work items* as they grow.
+    A plain array, not the paginated envelope used for tasks: this is a small
+    bounded reference set.
     """
     statement = select(User).order_by(User.id)
     if role is not None:

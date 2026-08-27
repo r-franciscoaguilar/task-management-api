@@ -9,11 +9,10 @@ from app.schemas.user import UserOut
 
 
 class AssignmentEventOut(BaseModel):
-    """One assignment, and what happened to its notification.
+    """One assignment and what happened to its notification.
 
-    `notification_status` is the point of this record. The brief asks that
-    whether someone was told "should not be invisible", so a failed send is
-    reported here rather than swallowed.
+    `notification_status` is the point of the record: a failed send is reported
+    rather than swallowed.
     """
 
     model_config = ConfigDict(from_attributes=True)

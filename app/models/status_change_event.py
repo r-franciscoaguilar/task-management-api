@@ -17,16 +17,12 @@ if TYPE_CHECKING:
 class StatusChangeEvent(Base):
     """An append-only record of one movement through the task lifecycle.
 
-    This tracks a different axis than AssignmentEvent. Assignment answers
-    "who owns this, and were they told"; this answers "where did the work
-    stand, who moved it, and why". The two genuinely diverge: reassigning a
-    task changes ownership without changing status, while starting one
-    changes status without changing ownership.
+    A different axis to AssignmentEvent: reassigning changes ownership without
+    changing status, and starting changes status without changing ownership.
 
-    `reason` is optional at the schema level but required by the service for
-    backward transitions -- it is how the business rule "work should not
-    bounce backward without a good reason" becomes an auditable record rather
-    than an unenforced expectation.
+    `reason` is nullable in the schema but required by the service for backward
+    transitions -- forward moves legitimately have none, so the rule belongs
+    where the direction is known.
     """
 
     __tablename__ = "status_change_events"

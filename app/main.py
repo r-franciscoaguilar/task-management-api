@@ -16,19 +16,16 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    # No Alembic: this is a greenfield single-file SQLite service with no
-    # deployment in scope, so create_all is enough. See the README for why,
-    # and what would change before production.
+    # No Alembic: greenfield, single SQLite file, no deployment in scope.
     Base.metadata.create_all(bind=engine)
 
-    # Seeding on boot is a deliberate operability choice: `uvicorn app.main:app`
-    # alone leaves a reviewer with data to exercise, no extra step to discover.
-    # It is a no-op once any user exists, so restarts never duplicate or clobber.
+    # Seeding on boot means `uvicorn` alone gives a reviewer usable data. It is
+    # a no-op once any user exists, so restarts never duplicate.
     with SessionLocal() as session:
         seed_if_empty(session)
 
-    # Loud on purpose: a redirect that goes unnoticed makes every notification
-    # look delivered while nobody who should have received one did.
+    # Loud on purpose: an unnoticed redirect makes notifications look delivered
+    # while nobody who should have received one did.
     settings = get_settings()
     if settings.notify_override_address:
         logger.warning(

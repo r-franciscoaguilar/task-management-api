@@ -9,11 +9,8 @@ from app.schemas.user import UserOut
 
 
 class StatusChangeEventOut(BaseModel):
-    """One movement through the lifecycle.
-
-    `reason` is populated only for backward moves, where the brief requires a
-    justification. Forward progress needs none, so it is null there.
-    """
+    """One movement through the lifecycle. `reason` is populated only for
+    backward moves."""
 
     model_config = ConfigDict(from_attributes=True)
 

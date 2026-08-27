@@ -6,21 +6,16 @@ from sqlalchemy.types import TypeDecorator
 
 
 def utcnow() -> datetime:
-    """Timezone-aware UTC now.
-
-    Used as the default for every timestamp column so stored values are
-    unambiguous rather than naive local time.
-    """
+    """Timezone-aware UTC now; the default for every timestamp column."""
     return datetime.now(timezone.utc)
 
 
 class UtcDateTime(TypeDecorator):
-    """A DateTime that always round-trips as timezone-aware UTC.
+    """A DateTime that round-trips as timezone-aware UTC.
 
-    SQLite has no native timezone support, so a value written through a plain
-    DateTime(timezone=True) comes back naive and would serialize into API
-    responses as an ambiguous bare timestamp. This normalizes to UTC on write
-    and re-attaches UTC on read, so clients always receive an explicit offset.
+    SQLite has no native timezone support, so values written through a plain
+    DateTime(timezone=True) come back naive and would serialize as ambiguous
+    bare timestamps.
     """
 
     impl = DateTime
