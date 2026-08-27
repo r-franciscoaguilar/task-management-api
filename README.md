@@ -19,6 +19,12 @@ there is no frontend, and other systems are expected to integrate with this API.
 Requires **Python 3.11+**. Developed on 3.13; CI runs the suite on both 3.11
 and 3.13, so the declared floor is tested rather than assumed.
 
+The full stack is three things: the API, a SQLite file (**no database server to
+install**), and a local SMTP server to catch the assignment emails. There is
+nothing else to provision — no Docker, no message broker, no mail account.
+
+**1. Install** — once
+
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
@@ -26,28 +32,55 @@ pip install -e ".[dev]"
 cp .env.example .env
 ```
 
-Assignment emails are really sent, so run a local mail catcher in one terminal
-and the API in another. No mail account is needed.
+**2. Start the mail catcher** — terminal 1
+
+Assignment emails are genuinely sent over SMTP, so something has to receive
+them. This prints each message it receives.
 
 ```bash
-# terminal 1 — catches the emails and prints them
+source .venv/bin/activate
 python -m aiosmtpd -n -l localhost:1025
+```
 
-# terminal 2 — the API
+**3. Start the API** — terminal 2
+
+```bash
+source .venv/bin/activate
 uvicorn app.main:app --reload      # http://127.0.0.1:8000
 ```
 
+The database is created and seeded with [demo data](#sample-data) on first
+boot — no migration or seeding step to run.
+
+**4. Check it works** — terminal 3
+
 ```bash
+source .venv/bin/activate
+
+curl -s localhost:8000/health                     # {"status":"ok"}
+curl -s localhost:8000/users -H 'X-User-Id: 1'    # 5 seeded users
+curl -s localhost:8000/tasks -H 'X-User-Id: 1'    # 7 seeded tasks
+
+# assign one, and watch the email arrive in terminal 1
+curl -s -X POST localhost:8000/tasks/1/assign -H 'X-User-Id: 1' \
+  -H 'Content-Type: application/json' -d '{"assignee_id": 3}'
+```
+
+Every request identifies its caller with the `X-User-Id` header — see
+[Acting as a user](#acting-as-a-user). Interactive docs are at
+`http://127.0.0.1:8000/docs`.
+
+**5. Run the tests**
+
+```bash
+source .venv/bin/activate
 pytest -q                          # 161 tests, ~2 seconds
 ```
 
-Assign a task and the message appears in terminal 1. With nothing listening on
-1025, assignments still succeed and the notification is recorded `FAILED` with
-the reason — designed behaviour, not a crash. See
-[Email delivery](#email-delivery) to point it at a real inbox.
-
-Interactive docs: `http://127.0.0.1:8000/docs`. The database is a SQLite file
-(`app.db`), created and seeded with [demo data](#sample-data) on first boot.
+With nothing listening on port 1025, assignments still succeed and the
+notification is recorded `FAILED` with the reason — designed behaviour, not a
+crash. See [Email delivery](#email-delivery) to point it at a real inbox
+instead.
 
 ```bash
 rm app.db                     # start completely clean
